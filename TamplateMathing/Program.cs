@@ -1,8 +1,9 @@
 ﻿using System;
+using System.IO;
 using System.Linq;
 using OpenCvSharp;
 
-class InteractiveROIMatcher
+class InteractiveTemplateMatcher
 {
     private static Mat _sourceImage;
     private static Mat _displayImage;
@@ -10,30 +11,66 @@ class InteractiveROIMatcher
     private static Rect _selectedROI;
     private static bool _isSelecting;
     private static Point _currentMousePos = new Point(0, 0);
+    private static string _templatePath = "template.jpg";
+    private static string _outputDir = "outputs";
+    private static string _firstImagePath;
 
     static void Main(string[] args)
     {
-        string sourcePath = "source.jpg";
-        string templatePath = "template.jpg";
-        string outputPath = "result.jpg";
-        //Console.WriteLine("当前工作目录: " + System.IO.Directory.GetCurrentDirectory());
+        string sourcesDir = "sources";
 
-        //读取源图像
-        _sourceImage = Cv2.ImRead(sourcePath, ImreadModes.Color);
-        if (_sourceImage.Empty())
+        // 初始化目录
+        Directory.CreateDirectory(_outputDir);
+        var imageFiles = Directory.GetFiles(sourcesDir)
+            .Where(f => f.EndsWith(".jpg") || f.EndsWith(".png")).ToArray();
+
+        if (imageFiles.Length == 0)
         {
-            Console.WriteLine("无法加载源图像");
+            Console.WriteLine("未找到图像文件！");
             return;
         }
 
-        const string windowName = "Select ROI (Drag mouse to select, ENTER to confirm)";
-        Cv2.NamedWindow(windowName, WindowFlags.AutoSize);
+        // 第一阶段：处理首张图像生成模板
+        _firstImagePath = imageFiles[0];
+        _sourceImage = Cv2.ImRead(_firstImagePath, ImreadModes.Color);
+        if (_sourceImage.Empty())
+        {
+            Console.WriteLine("首张图像加载失败");
+            return;
+        }
 
-        // 鼠标回调注册 手动绘制模板
+        if (!GenerateTemplate()) return;
+
+        // 第二阶段：批量处理所有图像
+        using (Mat template = Cv2.ImRead(_templatePath, ImreadModes.Color))
+        {
+            if (template.Empty())
+            {
+                Console.WriteLine("模板加载失败");
+                return;
+            }
+
+            foreach (var path in imageFiles)
+            {
+                string outputPath = Path.Combine(_outputDir, Path.GetFileName(path));
+                ProcessImage(path, outputPath, template);
+            }
+        }
+
+        Console.WriteLine("处理完成！结果保存在: " + Path.GetFullPath(_outputDir));
+    }
+
+    /// <summary>
+    /// 交互式生成模板
+    /// </summary>
+    private static bool GenerateTemplate()
+    {
+        const string windowName = "选择模板区域 (拖拽选择，按ENTER确认)";
+        Cv2.NamedWindow(windowName, WindowFlags.GuiNormal);
         Cv2.SetMouseCallback(windowName, OnMouse);
-
         _displayImage = _sourceImage.Clone();
 
+        bool success = false;
         while (true)
         {
             Cv2.ImShow(windowName, _displayImage);
@@ -41,26 +78,155 @@ class InteractiveROIMatcher
 
             if (key == 27) break; // ESC退出
 
-            if (key == 13 && _selectedROI.Width > 0 && _selectedROI.Height > 0) // ENTER确认
+            if (key == 13 && _selectedROI.Width > 0) // ENTER确认
             {
-                ProcessWithSelectedROI(templatePath, outputPath);
+                using (Mat template = new Mat(_sourceImage, _selectedROI))
+                {
+                    Cv2.ImWrite(_templatePath, template);
+                    Console.WriteLine("模板已生成: " + _templatePath);
+
+                    // 处理并保存首张结果
+                    string firstOutput = Path.Combine(_outputDir, Path.GetFileName(_firstImagePath));
+                    ProcessSingleImage(_sourceImage, firstOutput, template, _selectedROI);
+                    success = true;
+                }
                 break;
             }
+        }
+        Cv2.DestroyWindow(windowName);
+        return success;
+    }
 
-            if (_isSelecting)
+    /// <summary>
+    /// 处理单张图像
+    /// </summary>
+    private static void ProcessImage(string sourcePath, string outputPath, Mat template)
+    {
+        using (Mat src = Cv2.ImRead(sourcePath, ImreadModes.Color))
+        {
+            if (src.Empty())
             {
-                _displayImage = _sourceImage.Clone();
-                Cv2.Rectangle(_displayImage, _roiStart, _currentMousePos, Scalar.Red, 2);
+                Console.WriteLine($"加载失败: {sourcePath}");
+                return;
+            }
+
+            Rect roi = ValidateROI(src, _selectedROI);
+            ProcessSingleImage(src, outputPath, template, roi);
+        }
+    }
+
+    /// <summary>
+    /// 核心处理逻辑
+    /// </summary>
+    private static void ProcessSingleImage(Mat src, string outputPath, Mat template, Rect roi)
+    {
+        // 模板匹配
+        Point matchLoc;
+        double confidence;
+        using (Mat roiMat = new Mat(src, roi))
+        {
+            if (!MatchTemplate(roiMat, template, out matchLoc, out confidence)) return;
+        }
+
+        // 计算实际位置
+        Point actualLoc = new Point(roi.X + matchLoc.X, roi.Y + matchLoc.Y);
+
+        // 绘制结果
+        DrawResult(src, template, actualLoc, confidence);
+        Cv2.ImWrite(outputPath, src);
+        Console.WriteLine($"{Path.GetFileName(outputPath)}: 置信度 {confidence:P2}");
+    }
+
+    /// <summary>
+    /// ROI有效性校验
+    /// </summary>
+    private static Rect ValidateROI(Mat image, Rect roi)
+    {
+        return new Rect(
+            Clamp(roi.X, 0, image.Width - 1),
+            Clamp(roi.Y, 0, image.Height - 1),
+            Clamp(roi.Width, 1, image.Width - roi.X),
+            Clamp(roi.Height, 1, image.Height - roi.Y)
+        );
+    }
+
+    public static int Clamp(int value, int min, int max)
+    {
+        if (value < min) return min;
+        if (value > max) return max;
+        return value;
+    }
+
+    /// <summary>
+    /// 模板匹配算法
+    /// </summary>
+    private static bool MatchTemplate(Mat sourceROI, Mat template, out Point matchLoc, out double confidence)
+    {
+        matchLoc = new Point();
+        confidence = 0;
+
+        using (Mat srcGray = new Mat())
+        using (Mat tmpGray = new Mat())
+        using (Mat result = new Mat())
+        {
+            Cv2.CvtColor(sourceROI, srcGray, ColorConversionCodes.BGR2GRAY);
+            Cv2.CvtColor(template, tmpGray, ColorConversionCodes.BGR2GRAY);
+
+            Cv2.MatchTemplate(srcGray, tmpGray, result, TemplateMatchModes.CCoeffNormed);
+            result.MinMaxLoc(out _, out confidence, out _, out matchLoc);
+
+            return confidence > 0.75;
+        }
+    }
+
+    /// <summary>
+    /// 绘制结果（线宽调整为1像素）
+    /// </summary>
+    private static void DrawResult(Mat src, Mat template, Point location, double confidence)
+    {
+        // 绘制匹配区域轮廓
+        using (Mat matchedRegion = new Mat(src, new Rect(location, template.Size())))
+        using (Mat gray = new Mat())
+        {
+            Cv2.CvtColor(matchedRegion, gray, ColorConversionCodes.BGR2GRAY);
+            foreach (var contour in GetContours(gray))
+            {
+                Point[] globalContour = contour.Select(p =>
+                    new Point(p.X + location.X, p.Y + location.Y)).ToArray();
+                Cv2.Polylines(src, new[] { globalContour }, true, Scalar.Cyan, 1); // 线宽1
             }
         }
 
-        Cv2.DestroyAllWindows();
+        // 绘制中心十字（线宽2像素）
+        Point center = new Point(location.X + template.Width / 2, location.Y + template.Height / 2);
+        Cv2.DrawMarker(src, center, Scalar.Yellow, MarkerTypes.Cross, 20, 2);
+
+        // 添加文字
+        Cv2.PutText(src, $"Confidence: {confidence:P2}",
+            new Point(center.X - 60, center.Y - 30),
+            HersheyFonts.HersheySimplex, 0.6, Scalar.Yellow, 1);
     }
 
-    // 修正后的鼠标回调方法（必须使用这个精确签名）
+    /// <summary>
+    /// 获取轮廓（过滤小面积噪声）
+    /// </summary>
+    private static Point[][] GetContours(Mat image)
+    {
+        using (Mat edges = new Mat())
+        {
+            Cv2.Canny(image, edges, 100, 200);
+            Cv2.FindContours(edges, out Point[][] contours, out _,
+                RetrievalModes.External, ContourApproximationModes.ApproxSimple);
+            return contours.Where(c => Cv2.ContourArea(c) > 30).ToArray();
+        }
+    }
+
+    /// <summary>
+    /// 鼠标回调（线宽调整为1像素）
+    /// </summary>
     private static void OnMouse(MouseEventTypes @event, int x, int y, MouseEventFlags flags, IntPtr userdata)
     {
-        _currentMousePos = new Point(x, y); // 更新鼠标位置
+        _currentMousePos = new Point(x, y);
         switch (@event)
         {
             case MouseEventTypes.LButtonDown:
@@ -78,200 +244,16 @@ class InteractiveROIMatcher
                     Math.Abs(end.X - _roiStart.X),
                     Math.Abs(end.Y - _roiStart.Y)
                 );
-
                 _displayImage = _sourceImage.Clone();
-                Cv2.Rectangle(_displayImage, _selectedROI, Scalar.Green, 2);
-                Cv2.PutText(_displayImage, $"ROI Selected (Press ENTER)",
-                    new Point(10, 30),
-                    HersheyFonts.HersheyComplex, 0.3, Scalar.Red, 1);
+                Cv2.Rectangle(_displayImage, _selectedROI, Scalar.Green, 1); // 确认框线宽1
                 break;
         }
-    }
 
-    private static void ProcessWithSelectedROI(string templatePath, string outputPath)
-    {
-        using (Mat sourceROI = new Mat(_sourceImage, _selectedROI))
+        // 实时绘制选择框（线宽1像素）
+        if (_isSelecting)
         {
-            // 提示用户保存模板
-            Console.WriteLine("是否保存当前ROI为模板？(Y/N)");
-            if (Console.ReadKey().Key == ConsoleKey.Y)
-            {
-                // 保存模板图像
-                Cv2.ImWrite(templatePath, sourceROI);
-                Console.WriteLine($"\n模板已保存至: {templatePath}");
-            }
-        }
-
-            using (Mat template = Cv2.ImRead(templatePath, ImreadModes.Color))
-        {
-            if (template.Empty())
-            {
-                Console.WriteLine("无法加载模板图像");
-                return;
-            }
-
-            using (Mat sourceROI = new Mat(_sourceImage, _selectedROI))
-            {
-                const string roiWindowName = "ROI Preview (Press any key to continue)";
-                Cv2.NamedWindow(roiWindowName, WindowFlags.AutoSize);
-
-                Mat visualROI = sourceROI.Clone();
-                Cv2.PutText(visualROI, $"Size: {sourceROI.Width}x{sourceROI.Height}",
-                    new Point(5, 60),
-                    HersheyFonts.HersheySimplex, 0.3, Scalar.White, 1);
-                Cv2.ImShow(roiWindowName, visualROI);
-
-                Point matchLoc;
-                double confidence;
-                if (!MatchTemplate(sourceROI, template, out matchLoc, out confidence))
-                {
-                    Console.WriteLine("未找到匹配");
-                    Cv2.WaitKey(0);
-                    return;
-                }
-
-                DrawResult(_sourceImage, template, _selectedROI, matchLoc, confidence);
-                Cv2.ImWrite(outputPath, _sourceImage);
-
-                Console.WriteLine($"匹配完成！置信度: {confidence:P2}");
-                Cv2.ImShow("Final Result", _sourceImage);
-                //Cv2.WaitKey(0);
-          
-                Cv2.DestroyWindow(roiWindowName);
-            }
-        }
-    }
-
-    private static bool MatchTemplate(Mat sourceROI, Mat template, out Point matchLoc, out double confidence)
-    {
-        using (Mat sourceGray = new Mat())
-        using (Mat templateGray = new Mat())
-        using (Mat result = new Mat())
-        {
-            // 灰度转换提升匹配效率
-            Cv2.CvtColor(sourceROI, sourceGray, ColorConversionCodes.BGR2GRAY);
-            Cv2.CvtColor(template, templateGray, ColorConversionCodes.BGR2GRAY);
-
-            // 使用归一化相关系数匹配法
-            Cv2.MatchTemplate(
-                sourceGray,
-                templateGray,
-                result,
-                TemplateMatchModes.CCoeffNormed
-            );
-
-            // 获取最大匹配值和位置
-            result.MinMaxLoc(out _, out confidence, out _, out matchLoc);
-
-
-            return confidence > 0.75;   // 置信度阈值
-        }
-    }
-
-    private static void DrawResult(Mat source, Mat template, Rect roi, Point matchLoc, double confidence)
-    {
-        // 计算实际匹配位置
-        Point actualLoc = new Point(
-            roi.X + matchLoc.X,
-            roi.Y + matchLoc.Y
-        );
-
-        Rect resultRect = new Rect(
-            actualLoc.X,
-            actualLoc.Y,
-            template.Width,
-            template.Height
-        );
-        //Cv2.Rectangle(source, resultRect, Scalar.Red, 2);
-        //Cv2.Rectangle(source, roi, Scalar.Green, 1);
-
-        Cv2.PutText(source, $"Confidence: {confidence:P2}",
-            new Point(actualLoc.X - 10, actualLoc.Y - 20),
-            HersheyFonts.HersheyComplex, 0.4, Scalar.Red, 1);
-
-        // 1. 绘制模板轮廓
-        DrawTemplateContour(source, template, actualLoc);
-
-        // 2. 计算轮廓中心点并绘制十字
-        Point center = CalculateContourCenter(template);
-        Point centerInSource = new Point(
-            actualLoc.X + center.X,
-            actualLoc.Y + center.Y
-        );
-
-        // 绘制正十字（长度10像素，颜色黄色）
-        Cv2.DrawMarker(
-            source,
-            centerInSource,
-            Scalar.Yellow,
-            MarkerTypes.Cross,
-            10,  // 十字大小
-            1    // 线宽
-        );
-    }
-
-    // 计算模板轮廓的中心点
-    private static Point CalculateContourCenter(Mat template)
-    {
-        using (Mat templateGray = new Mat())
-        {
-            Cv2.CvtColor(template, templateGray, ColorConversionCodes.BGR2GRAY);
-            Point[][] contours = GetContours(templateGray);
-
-            if (contours.Length == 0)
-                return new Point(template.Width / 2, template.Height / 2); // 无轮廓时返回图像中心
-
-            // 取最大轮廓计算中心
-            var largestContour = contours
-                .OrderByDescending(c => Cv2.ContourArea(c))
-                .First();
-
-            Moments m = Cv2.Moments(largestContour);
-            int cx = (int)(m.M10 / m.M00);
-            int cy = (int)(m.M01 / m.M00);
-            return new Point(cx, cy);
-        }
-    }
-
-    //绘制模板轮廓（增强可视化效果）
-    private static void DrawTemplateContour(Mat source, Mat template, Point location)
-    {
-        using (Mat templateGray = new Mat())
-        {
-            Cv2.CvtColor(template, templateGray, ColorConversionCodes.BGR2GRAY);
-            Point[][] contours = GetContours(templateGray);
-
-            foreach (var contour in contours)
-            {
-                Point[] transformed = contour.Select(p =>
-                    new Point(p.X + location.X, p.Y + location.Y)
-                ).ToArray();
-
-                Cv2.Polylines(
-                    source,
-                    new[] { transformed },
-                    true,
-                    Scalar.Blue,
-                    2
-                );
-            }
-        }
-    }
-
-    private static Point[][] GetContours(Mat image)
-    {
-        using (Mat edges = new Mat())
-        {
-            // 通过Canny边缘检测提取轮廓
-            Cv2.Canny(image, edges, 100, 200);
-            Cv2.FindContours(
-                edges,
-                out Point[][] contours,
-                out _,
-                RetrievalModes.External,
-                ContourApproximationModes.ApproxSimple
-            );
-            return contours.Where(c => Cv2.ContourArea(c) > 50).ToArray();
+            _displayImage = _sourceImage.Clone();
+            Cv2.Rectangle(_displayImage, _roiStart, _currentMousePos, Scalar.Red, 1);
         }
     }
 }
