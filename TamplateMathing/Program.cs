@@ -3,6 +3,7 @@ using System.IO;
 using System.Linq;
 using OpenCvSharp;
 
+
 class InteractiveTemplateMatcher
 {
     private static Mat _sourceImage;
@@ -13,12 +14,14 @@ class InteractiveTemplateMatcher
     private static Point _currentMousePos = new Point(0, 0);
     private static string _templatePath = "template.jpg";
     private static string _outputDir = "outputs";
+    private static string _failureDir = "failures";
     private static string _firstImagePath;
 
     static void Main(string[] args)
     {
         string sourcesDir = "sources";
         Directory.CreateDirectory(_outputDir);
+        Directory.CreateDirectory(_failureDir);
 
         var imageFiles = Directory.GetFiles(sourcesDir)
            .Where(f => f.EndsWith(".jpg") || f.EndsWith(".png")).ToArray();
@@ -53,7 +56,7 @@ class InteractiveTemplateMatcher
                 ProcessImage(path, outputPath, template);
             }
         }
-        Console.WriteLine("处理完成！结果保存在: " + Path.GetFullPath(_outputDir));
+        Console.WriteLine("处理完成！匹配成功的图像保存在: " + Path.GetFullPath(_outputDir));
     }
 
     private static bool GenerateTemplate()
@@ -124,7 +127,12 @@ class InteractiveTemplateMatcher
         {
             Point matchLoc;
             double confidence;
-            if (!MatchTemplate(roiMat, template, out matchLoc, out confidence)) return;
+            if (!MatchTemplate(roiMat, template, out matchLoc, out confidence))
+            {
+                string failureReason = confidence == -1 ? "模板匹配异常" : $"置信度不足 ({confidence:P2})";
+                HandleFailure(src, outputPath, failureReason);
+                return;
+            }
 
             Point actualLoc = new Point(safeROI.X + matchLoc.X, safeROI.Y + matchLoc.Y);
 
@@ -132,6 +140,14 @@ class InteractiveTemplateMatcher
             Cv2.ImWrite(outputPath, src);
             Console.WriteLine($"{Path.GetFileName(outputPath)}: 置信度 {confidence:P2}");
         }
+    }
+
+    private static void HandleFailure(Mat src, string outputPath, string failureReason)
+    {
+        string fileName = Path.GetFileName(outputPath);
+        string failurePath = Path.Combine(_failureDir, fileName);
+        Cv2.ImWrite(failurePath, src);
+        Console.WriteLine($"匹配失败：{fileName}，原因：{failureReason}");
     }
 
     private static Rect ValidateROI(Mat image, Rect roi)
@@ -169,6 +185,7 @@ class InteractiveTemplateMatcher
         catch (Exception ex)
         {
             Console.WriteLine($"模板匹配异常: {ex.Message}");
+            confidence = -1;
             return false;
         }
     }
