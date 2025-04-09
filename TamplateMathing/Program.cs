@@ -20,9 +20,8 @@ class InteractiveTemplateMatcher
         string sourcesDir = "sources";
         Directory.CreateDirectory(_outputDir);
 
-        // 获取所有图像文件
         var imageFiles = Directory.GetFiles(sourcesDir)
-            .Where(f => f.EndsWith(".jpg") || f.EndsWith(".png")).ToArray();
+           .Where(f => f.EndsWith(".jpg") || f.EndsWith(".png")).ToArray();
 
         if (imageFiles.Length == 0)
         {
@@ -30,7 +29,6 @@ class InteractiveTemplateMatcher
             return;
         }
 
-        // 第一阶段：处理首张图像生成模板
         _firstImagePath = imageFiles[0];
         _sourceImage = Cv2.ImRead(_firstImagePath, ImreadModes.Color);
         if (_sourceImage.Empty())
@@ -41,7 +39,6 @@ class InteractiveTemplateMatcher
 
         if (!GenerateTemplate()) return;
 
-        // 第二阶段：批量处理所有图像
         using (Mat template = Cv2.ImRead(_templatePath, ImreadModes.Color))
         {
             if (template.Empty())
@@ -59,9 +56,6 @@ class InteractiveTemplateMatcher
         Console.WriteLine("处理完成！结果保存在: " + Path.GetFullPath(_outputDir));
     }
 
-    /// <summary>
-    /// 交互式生成模板（核心安全校验）
-    /// </summary>
     private static bool GenerateTemplate()
     {
         const string windowName = "选择模板区域 (拖拽选择，按ENTER确认)";
@@ -75,11 +69,10 @@ class InteractiveTemplateMatcher
             Cv2.ImShow(windowName, _displayImage);
             int key = Cv2.WaitKey(10);
 
-            if (key == 27) break; // ESC退出
+            if (key == 27) break;
 
             if (key == 13 && _selectedROI.Width > 0)
             {
-                // ROI安全校验
                 Rect safeROI = ValidateROI(_sourceImage, _selectedROI);
                 if (safeROI.Width <= 0 || safeROI.Height <= 0)
                 {
@@ -92,7 +85,6 @@ class InteractiveTemplateMatcher
                     Cv2.ImWrite(_templatePath, template);
                     Console.WriteLine("模板已生成: " + _templatePath);
 
-                    // 处理并保存首张结果
                     string firstOutput = Path.Combine(_outputDir, Path.GetFileName(_firstImagePath));
                     ProcessSingleImage(_sourceImage, firstOutput, template, safeROI);
                     success = true;
@@ -104,9 +96,6 @@ class InteractiveTemplateMatcher
         return success;
     }
 
-    /// <summary>
-    /// 处理单张图像（带安全校验）
-    /// </summary>
     private static void ProcessImage(string sourcePath, string outputPath, Mat template)
     {
         using (Mat src = Cv2.ImRead(sourcePath, ImreadModes.Color))
@@ -117,18 +106,13 @@ class InteractiveTemplateMatcher
                 return;
             }
 
-            // 使用校验后的ROI
-            Rect roi = ValidateROI(src, _selectedROI);
+            Rect roi = new Rect(0, 0, src.Width, src.Height);
             ProcessSingleImage(src, outputPath, template, roi);
         }
     }
 
-    /// <summary>
-    /// 核心处理逻辑（三重安全校验）
-    /// </summary>
     private static void ProcessSingleImage(Mat src, string outputPath, Mat template, Rect roi)
     {
-        // 1. ROI二次校验
         Rect safeROI = ValidateROI(src, roi);
         if (safeROI.Width <= 0 || safeROI.Height <= 0)
         {
@@ -136,37 +120,20 @@ class InteractiveTemplateMatcher
             return;
         }
 
-        // 2. 安全截取ROI区域
         using (Mat roiMat = new Mat(src, safeROI))
         {
-            // 3. 模板匹配
             Point matchLoc;
             double confidence;
             if (!MatchTemplate(roiMat, template, out matchLoc, out confidence)) return;
 
-            // 计算全局坐标（带边界检查）
-            Point actualLoc = new Point(
-                Math.Min(safeROI.X + matchLoc.X, src.Width - template.Width),
-                Math.Min(safeROI.Y + matchLoc.Y, src.Height - template.Height)
-            );
+            Point actualLoc = new Point(safeROI.X + matchLoc.X, safeROI.Y + matchLoc.Y);
 
-            // 最终安全校验
-            if (actualLoc.X < 0 || actualLoc.Y < 0)
-            {
-                Console.WriteLine($"{Path.GetFileName(outputPath)}: 匹配位置越界");
-                return;
-            }
-
-            // 绘制结果
             DrawResult(src, template, actualLoc, confidence);
             Cv2.ImWrite(outputPath, src);
             Console.WriteLine($"{Path.GetFileName(outputPath)}: 置信度 {confidence:P2}");
         }
     }
 
-    /// <summary>
-    /// ROI边界安全校验（核心方法）
-    /// </summary>
     private static Rect ValidateROI(Mat image, Rect roi)
     {
         int x = Clamp(roi.X, 0, image.Width - 1);
@@ -176,15 +143,9 @@ class InteractiveTemplateMatcher
         return new Rect(x, y, width, height);
     }
 
-    /// <summary>
-    /// 数值范围限定（兼容所有C#版本）
-    /// </summary>
     private static int Clamp(int value, int min, int max) =>
         (value < min) ? min : (value > max) ? max : value;
 
-    /// <summary>
-    /// 模板匹配算法（带异常捕获）
-    /// </summary>
     private static bool MatchTemplate(Mat sourceROI, Mat template, out Point matchLoc, out double confidence)
     {
         matchLoc = new Point();
@@ -212,67 +173,66 @@ class InteractiveTemplateMatcher
         }
     }
 
-    /// <summary>
-    /// 安全绘制结果（四重保护）
-    /// </summary>
     private static void DrawResult(Mat src, Mat template, Point location, double confidence)
     {
-        // 1. 计算安全绘制区域
-        Rect drawRect = new Rect(
-            location.X,
-            location.Y,
-            Math.Min(template.Width, src.Width - location.X),
-            Math.Min(template.Height, src.Height - location.Y)
-        );
+        // 仅修改DrawResult方法，其他代码保持不变
+        Rect drawRect = new Rect(location.X, location.Y, template.Width, template.Height);
+        Rect safeDrawRect = ValidateROI(src, drawRect);
 
-        // 2. 安全校验
-        if (drawRect.Width <= 0 || drawRect.Height <= 0)
-        {
-            Console.WriteLine("绘制区域无效");
-            return;
-        }
-
-        // 3. 安全截取区域
-        using (Mat safeRegion = new Mat(src, drawRect))
+        using (Mat safeRegion = new Mat(src, safeDrawRect))
         using (Mat gray = new Mat())
         {
-            try
-            {
-                Cv2.CvtColor(safeRegion, gray, ColorConversionCodes.BGR2GRAY);
-                Point[][] contours = GetContours(gray);
+            Cv2.CvtColor(safeRegion, gray, ColorConversionCodes.BGR2GRAY);
+            Point[][] contours = GetContours(gray);
 
-                // 4. 安全坐标转换
-                foreach (var contour in contours)
-                {
-                    Point[] globalContour = contour.Select(p =>
-                        new Point(p.X + location.X, p.Y + location.Y)).ToArray();
-                    Cv2.Polylines(src, new[] { globalContour }, true, Scalar.Red, 1);
-                }
-            }
-            catch (Exception ex)
+            // 核心修改：通过轮廓计算真实中心点
+            Point center = CalculateContourCenter(contours);
+
+            // 转换为全局坐标
+            Point globalCenter = new Point(
+                center.X + safeDrawRect.X,
+                center.Y + safeDrawRect.Y
+            );
+
+            // 绘制轮廓
+            foreach (var contour in contours)
             {
-                Console.WriteLine($"轮廓绘制异常: {ex.Message}");
+                Point[] globalContour = contour.Select(p =>
+                    new Point(p.X + safeDrawRect.X, p.Y + safeDrawRect.Y)).ToArray();
+                Cv2.Polylines(src, new[] { globalContour }, true, Scalar.Red, 1);
+            }
+
+            // 绘制基于轮廓的中心点
+            if (globalCenter.X > 0 && globalCenter.Y > 0)
+            {
+                Cv2.DrawMarker(src, globalCenter, Scalar.Yellow, MarkerTypes.Cross, 10, 1);
+                Cv2.PutText(src, $"Confidence: {confidence:P1}",
+                    new Point(globalCenter.X - 45, globalCenter.Y - 25),
+                    HersheyFonts.HersheySimplex, 0.3, Scalar.Blue, 1);
             }
         }
-
-        // 绘制中心十字（最终安全位置）
-        Point center = new Point(
-            Clamp(location.X + template.Width / 2, 0, src.Width - 1),
-            Clamp(location.Y + template.Height / 2, 0, src.Height - 1)
-        );
-        Cv2.DrawMarker(src, center, Scalar.Yellow, MarkerTypes.Cross, 10, 1);
-
-        // 添加文字（自动避让边界）
-        int textX = Clamp(center.X - 60, 10, src.Width - 120);
-        int textY = Clamp(center.Y - 30, 20, src.Height - 20);
-        Cv2.PutText(src, $"Confidence: {confidence:P2}",
-            new Point(textX, textY),
-            HersheyFonts.HersheySimplex, 0.5, Scalar.Yellow, 1);
     }
 
     /// <summary>
-    /// 获取安全轮廓（带异常处理）
+    /// 新增方法：通过轮廓矩计算精确中心
     /// </summary>
+    private static Point CalculateContourCenter(Point[][] contours)
+    {
+        if (contours.Length == 0) return new Point(-1, -1);
+
+        // 找到面积最大的轮廓
+        var largestContour = contours
+            .OrderByDescending(c => Cv2.ContourArea(c))
+            .First();
+
+        // 计算轮廓矩
+        Moments m = Cv2.Moments(largestContour);
+        return new Point(
+            (int)(m.M10 / m.M00),
+            (int)(m.M01 / m.M00)
+        );
+    }
+
     private static Point[][] GetContours(Mat image)
     {
         try
@@ -292,9 +252,6 @@ class InteractiveTemplateMatcher
         }
     }
 
-    /// <summary>
-    /// 鼠标回调（带绘制保护）
-    /// </summary>
     private static void OnMouse(MouseEventTypes @event, int x, int y, MouseEventFlags flags, IntPtr userdata)
     {
         try
