@@ -147,30 +147,34 @@ public class RobustTemplateMatcher
         Rect matchRect = new Rect(matchLoc, template.Size());
         Rect safeRect = ValidateROI(matchRect);
 
-        // 获取优化后的轮廓
         using (var roi = new Mat(src, safeRect))
         using (var gray = new Mat())
         {
             Cv2.CvtColor(roi, gray, ColorConversionCodes.BGR2GRAY);
             var contours = GetContours(gray);
 
-            // 绘制平滑轮廓
-            foreach (var contour in contours)
+            if (contours.Length > 0)
             {
-                var smoothContour = SmoothContour(contour)
+                var mainContour = contours.First();
+                // 保持原有轮廓绘制逻辑不变
+                var smoothContour = SmoothContour(mainContour)
                     .Select(p => new Point(p.X + safeRect.X, p.Y + safeRect.Y))
                     .ToArray();
                 Cv2.Polylines(src, new[] { smoothContour }, true, Scalar.Red, 2);
-            }
 
-            // 绘制中心标记
-            var center = new Point(
-                safeRect.X + template.Width / 2,
-                safeRect.Y + template.Height / 2
-            );
-            Cv2.DrawMarker(src, center, Scalar.Blue, MarkerTypes.Cross, 30, 2);
-            Cv2.PutText(src, $"{confidence:P1}", center + new Point(-40, -40),
-                HersheyFonts.HersheySimplex, 1.2, Scalar.Green, 2);
+                // 修改中心点计算方式
+                var localCenter = CalculateContourCenter(mainContour);
+                if (localCenter.X > 0 && localCenter.Y > 0)
+                {
+                    var globalCenter = new Point(
+                        safeRect.X + localCenter.X,
+                        safeRect.Y + localCenter.Y
+                    );
+                    Cv2.DrawMarker(src, globalCenter, Scalar.Blue, MarkerTypes.Cross, 30, 2);
+                    Cv2.PutText(src, $"{confidence:P1}", globalCenter + new Point(-40, -40),
+                        HersheyFonts.HersheySimplex, 1.2, Scalar.Green, 2);
+                }
+            }
         }
     }
 
@@ -179,56 +183,101 @@ public class RobustTemplateMatcher
     {
         using (var processed = new Mat())
         {
-            // 噪声抑制预处理
-            Cv2.MedianBlur(grayImage, processed, 3);
-            Cv2.GaussianBlur(processed, processed, new Size(5, 5), 1.5);
-            Cv2.EqualizeHist(processed, processed);
+            // 增强边缘保留处理
+            Cv2.MedianBlur(grayImage, processed, 5);
+            Cv2.AdaptiveThreshold(processed, processed, 255,
+                AdaptiveThresholdTypes.GaussianC,
+                ThresholdTypes.Binary, 11, 4);
 
-            // 边缘检测
-            Cv2.Canny(processed, processed, 80, 160, 3);
+            // 优化形态学操作参数
+            var kernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(3, 3));
+            Cv2.MorphologyEx(processed, processed, MorphTypes.Open, kernel, iterations: 2);
 
-            // 形态学优化
-            var kernel = Cv2.GetStructuringElement(MorphShapes.Ellipse, new Size(MorphologySize, MorphologySize));
-            Cv2.MorphologyEx(processed, processed, MorphTypes.Close, kernel, iterations: MorphologyIterations);
+            // 关键修改：使用层次结构分析排除ROI边界
+            Cv2.FindContours(processed, out Point[][] contours, out HierarchyIndex[] hierarchy,
+                RetrievalModes.External,
+                ContourApproximationModes.ApproxTC89KCOS);
 
-            // 轮廓提取
-            Cv2.FindContours(processed, out Point[][] contours, out _,
-                RetrievalModes.List, ContourApproximationModes.ApproxTC89KCOS);
+            List<Point[]> validContours = new List<Point[]>();
+            Rect roiArea = new Rect(0, 0, grayImage.Width, grayImage.Height);
 
-            // 轮廓筛选
-            return contours.Where(c =>
+            foreach (var contour in contours)
             {
-                double area = Cv2.ContourArea(c);
-                if (area < 100) return false;
+                // 排除与ROI边界重合的轮廓
+                var boundRect = Cv2.BoundingRect(contour);
+                bool isROIBorder =
+                    (boundRect.X <= 2 && boundRect.Width >= roiArea.Width - 4) ||
+                    (boundRect.Y <= 2 && boundRect.Height >= roiArea.Height - 4);
 
-                var rect = Cv2.BoundingRect(c);
-                double aspect = (double)rect.Width / rect.Height;
-                double solidity = area / Cv2.ContourArea(Cv2.ConvexHull(c));
+                // 有效性验证
+                double area = Cv2.ContourArea(contour);
+                if (!isROIBorder && area > 100 && area < roiArea.Area() * 0.95)
+                {
+                    validContours.Add(contour);
+                }
+            }
 
-                return aspect.Between(0.3, 3.0) && solidity > 0.8;
-            }).ToArray();
+            return validContours
+                .OrderByDescending(c => Cv2.ContourArea(c))
+                .Take(1)
+                .ToArray();
         }
     }
+
+
+    private static Point CalculateContourCenter(Point[] contour)
+    {
+        Moments m = Cv2.Moments(contour);
+        return m.M00 > 0 ?
+            new Point((int)(m.M10 / m.M00), (int)(m.M01 / m.M00)) :
+            new Point(-1, -1);
+    }
+    #endregion
+
+
+
 
     private static Point[] SmoothContour(Point[] contour)
     {
-        // 多边形近似
-        var approx = Cv2.ApproxPolyDP(contour, 0.01 * Cv2.ArcLength(contour, true), true);
+        // 简化平滑方法
+        const double epsilonFactor = 0.015;
+        double epsilon = epsilonFactor * Cv2.ArcLength(contour, true);
+        var approx = Cv2.ApproxPolyDP(contour, epsilon, true);
 
-        // 高斯平滑
-        var smoothed = new List<Point>();
-        for (int i = 0; i < approx.Length; i++)
+        // 显示平滑前后对比
+        using (var debugImg = new Mat(400, 400, MatType.CV_8UC3, Scalar.Black))
         {
-            int prev = (i - 1 + approx.Length) % approx.Length;
-            int next = (i + 1) % approx.Length;
-            smoothed.Add(new Point(
-                (approx[prev].X + 2 * approx[i].X + approx[next].X) / 4,
-                (approx[prev].Y + 2 * approx[i].Y + approx[next].Y) / 4
-            ));
+            Cv2.DrawContours(debugImg, new[] { contour }, -1, Scalar.Red, 1);
+            Cv2.DrawContours(debugImg, new[] { approx }, -1, Scalar.Green, 2);
+            Cv2.ImShow("Contour Smoothing", debugImg);
+            Cv2.WaitKey(1);
         }
-        return smoothed.ToArray();
+        return approx;
     }
-    #endregion
+
+    private static List<Point> GetOptimalControlPoints(Point[] contour)
+    {
+        // Ramer-Douglas-Peucker 算法优化控制点
+        var simplified = Cv2.ApproxPolyDP(contour, Cv2.ArcLength(contour, true) * 0.02, true);
+
+        // 均匀采样控制点
+        List<Point> controlPoints = new List<Point>();
+        const int SAMPLE_STEP = 5;
+        for (int i = 0; i < simplified.Length; i += SAMPLE_STEP)
+        {
+            controlPoints.Add(simplified[i]);
+            // 添加插值点
+            if (i > 0)
+            {
+                Point mid = new Point(
+                    (simplified[i].X + simplified[i - 1].X) / 2,
+                    (simplified[i].Y + simplified[i - 1].Y) / 2
+                );
+                controlPoints.Add(mid);
+            }
+        }
+        return controlPoints;
+    }
 
     #region 工具方法
     private static Rect ValidateROI(Rect roi)
@@ -317,4 +366,9 @@ public static class Extensions
 
     public static bool Between(this double value, double min, double max) =>
         value >= min && value <= max;
+
+    public static double Area(this Rect rect)
+    {
+        return rect.Width * (double)rect.Height;
+    }
 }
