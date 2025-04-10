@@ -1,67 +1,84 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using OpenCvSharp;
 
-
-class InteractiveTemplateMatcher
+public class RobustTemplateMatcher
 {
+    // 配置参数
+    private const double DefaultConfidenceThreshold = 0.75;
+    private const int MinTemplateSize = 20;
+    private const int MorphologySize = 3;
+    private const int MorphologyIterations = 2;
+
+    // 运行状态
     private static Mat _sourceImage;
     private static Mat _displayImage;
     private static Point _roiStart;
     private static Rect _selectedROI;
     private static bool _isSelecting;
-    private static Point _currentMousePos = new Point(0, 0);
     private static string _templatePath = "template.jpg";
     private static string _outputDir = "outputs";
     private static string _failureDir = "failures";
-    private static string _firstImagePath;
 
     static void Main(string[] args)
     {
-        string sourcesDir = "sources";
         Directory.CreateDirectory(_outputDir);
         Directory.CreateDirectory(_failureDir);
 
-        var imageFiles = Directory.GetFiles(sourcesDir)
-           .Where(f => f.EndsWith(".jpg") || f.EndsWith(".png")).ToArray();
+        var imageFiles = Directory.GetFiles("sources")
+            .Where(f => f.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase) ||
+                       f.EndsWith(".png", StringComparison.OrdinalIgnoreCase))
+            .OrderBy(f => f)
+            .ToArray();
 
         if (imageFiles.Length == 0)
         {
-            Console.WriteLine("未找到图像文件！");
+            Console.WriteLine("错误：未找到源图像！");
             return;
         }
 
-        _firstImagePath = imageFiles[0];
-        _sourceImage = Cv2.ImRead(_firstImagePath, ImreadModes.Color);
+        // 加载首张图像
+        _sourceImage = Cv2.ImRead(imageFiles[0], ImreadModes.Color);
         if (_sourceImage.Empty())
         {
-            Console.WriteLine("首张图像加载失败");
+            Console.WriteLine("错误：首张图像加载失败");
             return;
         }
 
-        if (!GenerateTemplate()) return;
+        // 交互式模板选择
+        if (!SelectTemplate())
+        {
+            Console.WriteLine("模板选择失败！");
+            return;
+        }
 
-        using (Mat template = Cv2.ImRead(_templatePath, ImreadModes.Color))
+        // 批量处理
+        using (var template = Cv2.ImRead(_templatePath, ImreadModes.Color))
         {
             if (template.Empty())
             {
-                Console.WriteLine("模板加载失败");
+                Console.WriteLine("错误：模板加载失败");
                 return;
             }
 
+            double threshold = GetConfidenceThreshold(args);
+            Console.WriteLine($"当前置信度阈值：{threshold:P0}");
+
             foreach (var path in imageFiles)
             {
-                string outputPath = Path.Combine(_outputDir, Path.GetFileName(path));
-                ProcessImage(path, outputPath, template);
+                ProcessImage(path, template, threshold);
             }
         }
-        Console.WriteLine("处理完成！匹配成功的图像保存在: " + Path.GetFullPath(_outputDir));
+
+        Console.WriteLine($"\n处理完成！\n成功图像：{Path.GetFullPath(_outputDir)}" +
+                         $"\n失败图像：{Path.GetFullPath(_failureDir)}");
     }
 
-    private static bool GenerateTemplate()
+    private static bool SelectTemplate()
     {
-        const string windowName = "选择模板区域 (拖拽选择，按ENTER确认)";
+        const string windowName = "选择模板区域 (拖拽选择，ENTER确认)";
         Cv2.NamedWindow(windowName, WindowFlags.GuiNormal);
         Cv2.SetMouseCallback(windowName, OnMouse);
         _displayImage = _sourceImage.Clone();
@@ -72,243 +89,232 @@ class InteractiveTemplateMatcher
             Cv2.ImShow(windowName, _displayImage);
             int key = Cv2.WaitKey(10);
 
-            if (key == 27) break;
+            if (key == 27) break; // ESC退出
 
-            if (key == 13 && _selectedROI.Width > 0)
+            if (key == 13) // ENTER确认
             {
-                Rect safeROI = ValidateROI(_sourceImage, _selectedROI);
-                if (safeROI.Width <= 0 || safeROI.Height <= 0)
+                var safeROI = ValidateROI(_selectedROI);
+                if (safeROI.Width >= MinTemplateSize && safeROI.Height >= MinTemplateSize)
                 {
-                    Console.WriteLine("无效的ROI区域！");
-                    break;
+                    using (var template = new Mat(_sourceImage, safeROI))
+                    {
+                        Cv2.ImWrite(_templatePath, template);
+                        Console.WriteLine($"模板已保存：{Path.GetFullPath(_templatePath)}");
+                        success = true;
+                        break;
+                    }
                 }
-
-                using (Mat template = new Mat(_sourceImage, safeROI))
-                {
-                    Cv2.ImWrite(_templatePath, template);
-                    Console.WriteLine("模板已生成: " + _templatePath);
-
-                    string firstOutput = Path.Combine(_outputDir, Path.GetFileName(_firstImagePath));
-                    ProcessSingleImage(_sourceImage, firstOutput, template, safeROI);
-                    success = true;
-                }
-                break;
+                Console.WriteLine($"ROI尺寸不足：{safeROI.Size}");
             }
         }
-        Cv2.DestroyWindow(windowName);
+        Cv2.DestroyAllWindows();
         return success;
     }
 
-    private static void ProcessImage(string sourcePath, string outputPath, Mat template)
+    private static void ProcessImage(string sourcePath, Mat template, double threshold)
     {
-        using (Mat src = Cv2.ImRead(sourcePath, ImreadModes.Color))
+        string fileName = Path.GetFileName(sourcePath);
+        using (var src = Cv2.ImRead(sourcePath, ImreadModes.Color))
         {
             if (src.Empty())
             {
-                Console.WriteLine($"加载失败: {sourcePath}");
+                MoveToFailure(sourcePath, "图像加载失败");
                 return;
             }
 
-            Rect roi = new Rect(0, 0, src.Width, src.Height);
-            ProcessSingleImage(src, outputPath, template, roi);
-        }
-    }
-
-    private static void ProcessSingleImage(Mat src, string outputPath, Mat template, Rect roi)
-    {
-        Rect safeROI = ValidateROI(src, roi);
-        if (safeROI.Width <= 0 || safeROI.Height <= 0)
-        {
-            Console.WriteLine($"{Path.GetFileName(outputPath)}: 无效的ROI区域");
-            return;
-        }
-
-        using (Mat roiMat = new Mat(src, safeROI))
-        {
-            Point matchLoc;
-            double confidence;
-            if (!MatchTemplate(roiMat, template, out matchLoc, out confidence))
+            // 执行模板匹配
+            using (var result = new Mat())
             {
-                string failureReason = confidence == -1 ? "模板匹配异常" : $"置信度不足 ({confidence:P2})";
-                HandleFailure(src, outputPath, failureReason);
-                return;
-            }
+                Cv2.MatchTemplate(src, template, result, TemplateMatchModes.CCoeffNormed);
+                result.MinMaxLoc(out _, out double confidence, out _, out Point maxLoc);
 
-            Point actualLoc = new Point(safeROI.X + matchLoc.X, safeROI.Y + matchLoc.Y);
+                if (confidence < threshold)
+                {
+                    MoveToFailure(sourcePath, $"置信度不足 ({confidence:P2})");
+                    return;
+                }
 
-            DrawResult(src, template, actualLoc, confidence);
-            Cv2.ImWrite(outputPath, src);
-            Console.WriteLine($"{Path.GetFileName(outputPath)}: 置信度 {confidence:P2}");
-        }
-    }
-
-    private static void HandleFailure(Mat src, string outputPath, string failureReason)
-    {
-        string fileName = Path.GetFileName(outputPath);
-        string failurePath = Path.Combine(_failureDir, fileName);
-        Cv2.ImWrite(failurePath, src);
-        Console.WriteLine($"匹配失败：{fileName}，原因：{failureReason}");
-    }
-
-    private static Rect ValidateROI(Mat image, Rect roi)
-    {
-        int x = Clamp(roi.X, 0, image.Width - 1);
-        int y = Clamp(roi.Y, 0, image.Height - 1);
-        int width = Clamp(roi.Width, 1, image.Width - x);
-        int height = Clamp(roi.Height, 1, image.Height - y);
-        return new Rect(x, y, width, height);
-    }
-
-    private static int Clamp(int value, int min, int max) =>
-        (value < min) ? min : (value > max) ? max : value;
-
-    private static bool MatchTemplate(Mat sourceROI, Mat template, out Point matchLoc, out double confidence)
-    {
-        matchLoc = new Point();
-        confidence = 0;
-
-        try
-        {
-            using (Mat srcGray = new Mat())
-            using (Mat tmpGray = new Mat())
-            using (Mat result = new Mat())
-            {
-                Cv2.CvtColor(sourceROI, srcGray, ColorConversionCodes.BGR2GRAY);
-                Cv2.CvtColor(template, tmpGray, ColorConversionCodes.BGR2GRAY);
-
-                Cv2.MatchTemplate(srcGray, tmpGray, result, TemplateMatchModes.CCoeffNormed);
-                result.MinMaxLoc(out _, out confidence, out _, out matchLoc);
-
-                return confidence > 0.75;
+                // 绘制优化后的结果
+                DrawOptimizedResult(src, template, maxLoc, confidence);
+                Cv2.ImWrite(Path.Combine(_outputDir, fileName), src);
+                Console.WriteLine($"成功：{fileName} ({confidence:P2})");
             }
         }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"模板匹配异常: {ex.Message}");
-            confidence = -1;
-            return false;
-        }
     }
 
-    private static void DrawResult(Mat src, Mat template, Point location, double confidence)
+    private static void DrawOptimizedResult(Mat src, Mat template, Point matchLoc, double confidence)
     {
-        // 仅修改DrawResult方法，其他代码保持不变
-        Rect drawRect = new Rect(location.X, location.Y, template.Width, template.Height);
-        Rect safeDrawRect = ValidateROI(src, drawRect);
+        Rect matchRect = new Rect(matchLoc, template.Size());
+        Rect safeRect = ValidateROI(matchRect);
 
-        using (Mat safeRegion = new Mat(src, safeDrawRect))
-        using (Mat gray = new Mat())
+        // 获取优化后的轮廓
+        using (var roi = new Mat(src, safeRect))
+        using (var gray = new Mat())
         {
-            Cv2.CvtColor(safeRegion, gray, ColorConversionCodes.BGR2GRAY);
-            Point[][] contours = GetContours(gray);
+            Cv2.CvtColor(roi, gray, ColorConversionCodes.BGR2GRAY);
+            var contours = GetContours(gray);
 
-            // 核心修改：通过轮廓计算真实中心点
-            Point center = CalculateContourCenter(contours);
-
-            // 转换为全局坐标
-            Point globalCenter = new Point(
-                center.X + safeDrawRect.X,
-                center.Y + safeDrawRect.Y
-            );
-
-            // 绘制轮廓
+            // 绘制平滑轮廓
             foreach (var contour in contours)
             {
-                Point[] globalContour = contour.Select(p =>
-                    new Point(p.X + safeDrawRect.X, p.Y + safeDrawRect.Y)).ToArray();
-                Cv2.Polylines(src, new[] { globalContour }, true, Scalar.Red, 1);
+                var smoothContour = SmoothContour(contour)
+                    .Select(p => new Point(p.X + safeRect.X, p.Y + safeRect.Y))
+                    .ToArray();
+                Cv2.Polylines(src, new[] { smoothContour }, true, Scalar.Red, 2);
             }
 
-            // 绘制基于轮廓的中心点
-            if (globalCenter.X > 0 && globalCenter.Y > 0)
-            {
-                Cv2.DrawMarker(src, globalCenter, Scalar.Yellow, MarkerTypes.Cross, 10, 1);
-                Cv2.PutText(src, $"Confidence: {confidence:P1}",
-                    new Point(globalCenter.X - 45, globalCenter.Y - 25),
-                    HersheyFonts.HersheySimplex, 0.3, Scalar.Blue, 1);
-            }
+            // 绘制中心标记
+            var center = new Point(
+                safeRect.X + template.Width / 2,
+                safeRect.Y + template.Height / 2
+            );
+            Cv2.DrawMarker(src, center, Scalar.Blue, MarkerTypes.Cross, 30, 2);
+            Cv2.PutText(src, $"{confidence:P1}", center + new Point(-40, -40),
+                HersheyFonts.HersheySimplex, 1.2, Scalar.Green, 2);
         }
     }
 
-    /// <summary>
-    /// 新增方法：通过轮廓矩计算精确中心
-    /// </summary>
-    private static Point CalculateContourCenter(Point[][] contours)
+    #region 核心算法模块
+    private static Point[][] GetContours(Mat grayImage)
     {
-        if (contours.Length == 0) return new Point(-1, -1);
+        using (var processed = new Mat())
+        {
+            // 噪声抑制预处理
+            Cv2.MedianBlur(grayImage, processed, 3);
+            Cv2.GaussianBlur(processed, processed, new Size(5, 5), 1.5);
+            Cv2.EqualizeHist(processed, processed);
 
-        // 找到面积最大的轮廓
-        var largestContour = contours
-            .OrderByDescending(c => Cv2.ContourArea(c))
-            .First();
+            // 边缘检测
+            Cv2.Canny(processed, processed, 80, 160, 3);
 
-        // 计算轮廓矩
-        Moments m = Cv2.Moments(largestContour);
-        return new Point(
-            (int)(m.M10 / m.M00),
-            (int)(m.M01 / m.M00)
+            // 形态学优化
+            var kernel = Cv2.GetStructuringElement(MorphShapes.Ellipse, new Size(MorphologySize, MorphologySize));
+            Cv2.MorphologyEx(processed, processed, MorphTypes.Close, kernel, iterations: MorphologyIterations);
+
+            // 轮廓提取
+            Cv2.FindContours(processed, out Point[][] contours, out _,
+                RetrievalModes.List, ContourApproximationModes.ApproxTC89KCOS);
+
+            // 轮廓筛选
+            return contours.Where(c =>
+            {
+                double area = Cv2.ContourArea(c);
+                if (area < 100) return false;
+
+                var rect = Cv2.BoundingRect(c);
+                double aspect = (double)rect.Width / rect.Height;
+                double solidity = area / Cv2.ContourArea(Cv2.ConvexHull(c));
+
+                return aspect.Between(0.3, 3.0) && solidity > 0.8;
+            }).ToArray();
+        }
+    }
+
+    private static Point[] SmoothContour(Point[] contour)
+    {
+        // 多边形近似
+        var approx = Cv2.ApproxPolyDP(contour, 0.01 * Cv2.ArcLength(contour, true), true);
+
+        // 高斯平滑
+        var smoothed = new List<Point>();
+        for (int i = 0; i < approx.Length; i++)
+        {
+            int prev = (i - 1 + approx.Length) % approx.Length;
+            int next = (i + 1) % approx.Length;
+            smoothed.Add(new Point(
+                (approx[prev].X + 2 * approx[i].X + approx[next].X) / 4,
+                (approx[prev].Y + 2 * approx[i].Y + approx[next].Y) / 4
+            ));
+        }
+        return smoothed.ToArray();
+    }
+    #endregion
+
+    #region 工具方法
+    private static Rect ValidateROI(Rect roi)
+    {
+        return new Rect(
+            Clamp(roi.X, 0, _sourceImage.Width - 1),
+            Clamp(roi.Y, 0, _sourceImage.Height - 1),
+            Clamp(roi.Width, 1, _sourceImage.Width - roi.X),
+            Clamp(roi.Height, 1, _sourceImage.Height - roi.Y)
         );
     }
 
-    private static Point[][] GetContours(Mat image)
+    private static double GetConfidenceThreshold(string[] args)
+    {
+        if (args.Length > 0 && double.TryParse(args[0], out double t))
+            return Clamp_double(t, 0.5, 0.95);
+        return DefaultConfidenceThreshold;
+    }
+
+    private static void MoveToFailure(string sourcePath, string reason)
     {
         try
         {
-            using (Mat edges = new Mat())
-            {
-                Cv2.Canny(image, edges, 100, 200);
-                Cv2.FindContours(edges, out Point[][] contours, out _,
-                    RetrievalModes.External, ContourApproximationModes.ApproxSimple);
-                return contours.Where(c => Cv2.ContourArea(c) > 30).ToArray();
-            }
+            string dest = Path.Combine(_failureDir, Path.GetFileName(sourcePath));
+            File.Copy(sourcePath, dest, true);
+            Console.WriteLine($"失败：{Path.GetFileName(sourcePath)} - {reason}");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"轮廓提取异常: {ex.Message}");
-            return Array.Empty<Point[]>();
+            Console.WriteLine($"文件保存失败：{ex.Message}");
         }
     }
 
-    private static void OnMouse(MouseEventTypes @event, int x, int y, MouseEventFlags flags, IntPtr userdata)
+    private static void OnMouse(MouseEventTypes e, int x, int y, MouseEventFlags f, IntPtr d)
     {
-        try
+        var pt = new Point(x, y).Clamp(_sourceImage.Size());
+
+        switch (e)
         {
-            _currentMousePos = new Point(
-                Clamp(x, 0, _sourceImage.Width - 1),
-                Clamp(y, 0, _sourceImage.Height - 1)
-            );
+            case MouseEventTypes.LButtonDown:
+                _isSelecting = true;
+                _roiStart = pt;
+                _selectedROI = new Rect(pt, new Size(0, 0));
+                break;
 
-            switch (@event)
-            {
-                case MouseEventTypes.LButtonDown:
-                    _isSelecting = true;
-                    _roiStart = _currentMousePos;
-                    _selectedROI = new Rect(_currentMousePos, new Size(0, 0));
-                    break;
-
-                case MouseEventTypes.LButtonUp:
-                    _isSelecting = false;
-                    Point end = _currentMousePos;
-                    _selectedROI = new Rect(
-                        Math.Min(_roiStart.X, end.X),
-                        Math.Min(_roiStart.Y, end.Y),
-                        Math.Abs(end.X - _roiStart.X),
-                        Math.Abs(end.Y - _roiStart.Y)
-                    );
-                    _displayImage = _sourceImage.Clone();
-                    Cv2.Rectangle(_displayImage, ValidateROI(_sourceImage, _selectedROI), Scalar.Green, 1);
-                    break;
-            }
-
-            if (_isSelecting)
-            {
+            case MouseEventTypes.MouseMove when _isSelecting:
                 _displayImage = _sourceImage.Clone();
-                Cv2.Rectangle(_displayImage, _roiStart, _currentMousePos, Scalar.Red, 1);
-            }
+                Cv2.Rectangle(_displayImage, _roiStart, pt, Scalar.Red, 2);
+                break;
+
+            case MouseEventTypes.LButtonUp:
+                _isSelecting = false;
+                _selectedROI = new Rect(
+                    Math.Min(_roiStart.X, pt.X),
+                    Math.Min(_roiStart.Y, pt.Y),
+                    Math.Abs(pt.X - _roiStart.X),
+                    Math.Abs(pt.Y - _roiStart.Y)
+                );
+                break;
         }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"鼠标回调异常: {ex.Message}");
-        }
+
     }
+    public static int Clamp(int value, int min, int max)
+    {
+        return Math.Max(min, Math.Min(value, max));
+    }
+
+    public static double Clamp_double(double value, double min, double max)
+    {
+        return Math.Max(min, Math.Min(value, max));
+    }
+    #endregion
+}
+
+
+public static class Extensions
+{
+    public static int Clamp(int value, int min, int max)
+    {
+        return Math.Max(min, Math.Min(value, max));
+    }
+    public static Point Clamp(this Point p, Size size) => new Point(
+        Clamp(p.X, 0, size.Width - 1),
+        Clamp(p.Y, 0, size.Height - 1)
+    );
+
+    public static bool Between(this double value, double min, double max) =>
+        value >= min && value <= max;
 }
