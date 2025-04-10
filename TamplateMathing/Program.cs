@@ -18,7 +18,7 @@ public class RobustTemplateMatcher
     private static Point _roiStart;
     private static Rect _selectedROI;
     private static bool _isSelecting;
-    private static string _templatePath = "template.jpg";
+    private static string _templatePath = "template.bmp";
     private static string _outputDir = "outputs";
     private static string _failureDir = "failures";
 
@@ -29,8 +29,9 @@ public class RobustTemplateMatcher
 
         var imageFiles = Directory.GetFiles("sources")
             .Where(f => f.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase) ||
-                       f.EndsWith(".png", StringComparison.OrdinalIgnoreCase))
-            .OrderBy(f => f)
+                       f.EndsWith(".png", StringComparison.OrdinalIgnoreCase) ||
+                       f.EndsWith(".bmp", StringComparison.OrdinalIgnoreCase))
+                    .OrderBy(f => f)
             .ToArray();
 
         if (imageFiles.Length == 0)
@@ -144,6 +145,7 @@ public class RobustTemplateMatcher
 
     private static void DrawOptimizedResult(Mat src, Mat template, Point matchLoc, double confidence)
     {
+
         Rect matchRect = new Rect(matchLoc, template.Size());
         Rect safeRect = ValidateROI(matchRect);
 
@@ -181,10 +183,22 @@ public class RobustTemplateMatcher
     #region 核心算法模块
     private static Point[][] GetContours(Mat grayImage)
     {
+        Cv2.ImShow("1. Original Gray", grayImage);
+        Cv2.WaitKey(1000);
+
         using (var processed = new Mat())
         {
             // 增强边缘保留处理
             Cv2.MedianBlur(grayImage, processed, 5);
+            Cv2.ImShow("2. After MedianBlur", processed);
+            Cv2.WaitKey(1000);
+
+
+            // 步骤3：使用经典Canny边缘检测
+            Cv2.Canny(processed, processed, 50, 100);
+            Cv2.ImShow("3. Canny Edges", processed);
+            Cv2.WaitKey(1000);
+
             Cv2.AdaptiveThreshold(processed, processed, 255,
                 AdaptiveThresholdTypes.GaussianC,
                 ThresholdTypes.Binary, 11, 4);
@@ -192,6 +206,9 @@ public class RobustTemplateMatcher
             // 优化形态学操作参数
             var kernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(3, 3));
             Cv2.MorphologyEx(processed, processed, MorphTypes.Open, kernel, iterations: 2);
+
+            Cv2.ImShow("4. After Morphology", processed);
+            Cv2.WaitKey(1000);
 
             // 关键修改：使用层次结构分析排除ROI边界
             Cv2.FindContours(processed, out Point[][] contours, out HierarchyIndex[] hierarchy,
@@ -255,29 +272,7 @@ public class RobustTemplateMatcher
         return approx;
     }
 
-    private static List<Point> GetOptimalControlPoints(Point[] contour)
-    {
-        // Ramer-Douglas-Peucker 算法优化控制点
-        var simplified = Cv2.ApproxPolyDP(contour, Cv2.ArcLength(contour, true) * 0.02, true);
-
-        // 均匀采样控制点
-        List<Point> controlPoints = new List<Point>();
-        const int SAMPLE_STEP = 5;
-        for (int i = 0; i < simplified.Length; i += SAMPLE_STEP)
-        {
-            controlPoints.Add(simplified[i]);
-            // 添加插值点
-            if (i > 0)
-            {
-                Point mid = new Point(
-                    (simplified[i].X + simplified[i - 1].X) / 2,
-                    (simplified[i].Y + simplified[i - 1].Y) / 2
-                );
-                controlPoints.Add(mid);
-            }
-        }
-        return controlPoints;
-    }
+ 
 
     #region 工具方法
     private static Rect ValidateROI(Rect roi)
