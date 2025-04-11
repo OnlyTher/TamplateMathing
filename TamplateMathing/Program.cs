@@ -145,7 +145,6 @@ public class RobustTemplateMatcher
 
     private static void DrawOptimizedResult(Mat src, Mat template, Point matchLoc, double confidence)
     {
-
         Rect matchRect = new Rect(matchLoc, template.Size());
         Rect safeRect = ValidateROI(matchRect);
 
@@ -158,13 +157,17 @@ public class RobustTemplateMatcher
             if (contours.Length > 0)
             {
                 var mainContour = contours.First();
-                // 保持原有轮廓绘制逻辑不变
-                var smoothContour = SmoothContour(mainContour)
+
+                // 转换坐标系到原图
+                var globalContour = mainContour
                     .Select(p => new Point(p.X + safeRect.X, p.Y + safeRect.Y))
                     .ToArray();
-                Cv2.Polylines(src, new[] { smoothContour }, true, Scalar.Red, 2);
 
-                // 修改中心点计算方式
+                // 绘制最小面积轮廓
+                Cv2.DrawContours(src, new[] { globalContour }, -1, Scalar.Red, 2);
+
+
+                // 中心点计算
                 var localCenter = CalculateContourCenter(mainContour);
                 if (localCenter.X > 0 && localCenter.Y > 0)
                 {
@@ -180,6 +183,7 @@ public class RobustTemplateMatcher
         }
     }
 
+
     #region 核心算法模块
     private static Point[][] GetContours(Mat grayImage)
     {
@@ -188,31 +192,33 @@ public class RobustTemplateMatcher
 
         using (var processed = new Mat())
         {
-            // 增强边缘保留处理
+            // 增强边缘保留预处理
             Cv2.MedianBlur(grayImage, processed, 5);
             Cv2.ImShow("2. After MedianBlur", processed);
             Cv2.WaitKey(1000);
 
 
-            // 步骤3：使用经典Canny边缘检测
-            Cv2.Canny(processed, processed, 50, 100);
+            // 使用经典Canny边缘检测
+            Cv2.Canny(processed, processed, 70, 135);
             Cv2.ImShow("3. Canny Edges", processed);
             Cv2.WaitKey(1000);
 
-            Cv2.AdaptiveThreshold(processed, processed, 255,
-                AdaptiveThresholdTypes.GaussianC,
-                ThresholdTypes.Binary, 11, 4);
-
-            // 优化形态学操作参数
-            var kernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(3, 3));
-            Cv2.MorphologyEx(processed, processed, MorphTypes.Open, kernel, iterations: 2);
-
-            Cv2.ImShow("4. After Morphology", processed);
+            // 增大闭合运算的kernel尺寸并增加迭代
+            var closeKernel = Cv2.GetStructuringElement(MorphShapes.Ellipse, new Size(8, 8));
+            Cv2.MorphologyEx(processed, processed, MorphTypes.Close, closeKernel, iterations: 5);
+            Cv2.ImShow("3. Canny Edges", processed);
             Cv2.WaitKey(1000);
 
-            // 关键修改：使用层次结构分析排除ROI边界
+            //自适应阈值
+            Cv2.AdaptiveThreshold(processed, processed, 255,
+                AdaptiveThresholdTypes.GaussianC,
+                ThresholdTypes.Binary, 21, 5);
+            Cv2.ImShow("4. After AdaptiveThreshold", processed);
+            Cv2.WaitKey(1000);
+
+            // 轮廓检测
             Cv2.FindContours(processed, out Point[][] contours, out HierarchyIndex[] hierarchy,
-                RetrievalModes.External,
+                RetrievalModes.List,  // 改为检索所有独立轮廓
                 ContourApproximationModes.ApproxTC89KCOS);
 
             List<Point[]> validContours = new List<Point[]>();
@@ -220,24 +226,47 @@ public class RobustTemplateMatcher
 
             foreach (var contour in contours)
             {
-                // 排除与ROI边界重合的轮廓
                 var boundRect = Cv2.BoundingRect(contour);
                 bool isROIBorder =
                     (boundRect.X <= 2 && boundRect.Width >= roiArea.Width - 4) ||
                     (boundRect.Y <= 2 && boundRect.Height >= roiArea.Height - 4);
 
-                // 有效性验证
+                // 优化筛选条件
                 double area = Cv2.ContourArea(contour);
-                if (!isROIBorder && area > 100 && area < roiArea.Area() * 0.95)
+                double aspectRatio = (double)boundRect.Width / boundRect.Height;
+
+                // 计算轮廓的圆形度（排除线状噪声）
+                double perimeter = Cv2.ArcLength(contour, true);
+                double circularity = (4 * Math.PI * area) / (perimeter * perimeter);
+
+                // 调试信息输出
+                Console.WriteLine($"候选轮廓: 面积={area} 宽高比={aspectRatio:0.00} 圆形度={circularity:0.00}");
+
+                if (!isROIBorder &&
+                    area > grayImage.Width * grayImage.Height * 0.1 && // 面积至少占ROI区域的10%
+                    aspectRatio.Between(0.5, 2.5) &&     // 放宽宽高比限制
+                    circularity > 0.3)                  // 排除线状轮廓
                 {
                     validContours.Add(contour);
                 }
             }
 
-            return validContours
+            // 关键修改3：按面积降序排列，取前3个候选
+            var sortedContours = validContours
                 .OrderByDescending(c => Cv2.ContourArea(c))
-                .Take(1)
+                .Take(3)
                 .ToArray();
+
+            // 关键修改4：添加形状验证（选择最接近矩形的轮廓）
+            var bestContour = sortedContours
+                .OrderBy(c =>
+                {
+                    var approx = Cv2.ApproxPolyDP(c, 0.02 * Cv2.ArcLength(c, true), true);
+                    return Math.Abs(4 - approx.Length); // 四边形得分为0
+                })
+                .FirstOrDefault();
+
+            return bestContour != null ? new[] { bestContour } : new Point[0][];
         }
     }
 
@@ -256,23 +285,41 @@ public class RobustTemplateMatcher
 
     private static Point[] SmoothContour(Point[] contour)
     {
-        // 简化平滑方法
-        const double epsilonFactor = 0.015;
-        double epsilon = epsilonFactor * Cv2.ArcLength(contour, true);
-        var approx = Cv2.ApproxPolyDP(contour, epsilon, true);
+        // 增加点密度（插值处理）
+        var denseContour = new List<Point>();
+        for (int i = 0; i < contour.Length; i++)
+        {
+            Point p1 = contour[i];
+            Point p2 = contour[(i + 1) % contour.Length];
 
-        // 显示平滑前后对比
+            // 每两个点之间插入3个插值点
+            for (double t = 0; t <= 1; t += 0.25)
+            {
+                denseContour.Add(new Point(
+                    (int)(p1.X * (1 - t) + p2.X * t),
+                    (int)(p1.Y * (1 - t) + p2.Y * t)
+                ));
+            }
+        }
+
+        // 使用带角度约束的多边形近似
+        double epsilon = 0.02 * Cv2.ArcLength(denseContour, true);
+        var approx = Cv2.ApproxPolyDP(denseContour, epsilon, true);
+
+
+        // 在调试显示
         using (var debugImg = new Mat(400, 400, MatType.CV_8UC3, Scalar.Black))
         {
-            Cv2.DrawContours(debugImg, new[] { contour }, -1, Scalar.Red, 1);
+            Cv2.DrawContours(debugImg, new[] { denseContour }, -1, Scalar.Gray, 1);
             Cv2.DrawContours(debugImg, new[] { approx }, -1, Scalar.Green, 2);
-            Cv2.ImShow("Contour Smoothing", debugImg);
-            Cv2.WaitKey(1);
+            Cv2.ImShow("Contour Smoothing Process", debugImg);
+            Cv2.WaitKey(1000);
         }
+
         return approx;
     }
 
- 
+
 
     #region 工具方法
     private static Rect ValidateROI(Rect roi)
