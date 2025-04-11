@@ -88,7 +88,7 @@ public class RobustTemplateMatcher
         while (true)
         {
             Cv2.ImShow(windowName, _displayImage);
-            int key = Cv2.WaitKey(10);
+            int key = Cv2.WaitKey(1000);
 
             if (key == 27) break; // ESC退出
 
@@ -216,113 +216,190 @@ public class RobustTemplateMatcher
     private static Point[][] GetContours(Mat grayImage)
     {
         Cv2.ImShow("1. Original Gray", grayImage);
-        Cv2.WaitKey(500); // 缩短等待时间
+        Cv2.WaitKey(1000); // 快速调试模式
 
         using (var validatedImage = Ensure8UC1(grayImage))
         using (var processed = new Mat())
         {
-            // ===== 预处理优化 =====
-            // 修改点1：增强降噪能力
-            Cv2.MedianBlur(validatedImage, processed, 7); // 孔径从5→7
+            // ===== [预处理阶段] =====
+            // 修改点1：优化降噪参数
+            Cv2.MedianBlur(validatedImage, processed, 7);  // 孔径7平衡降噪与细节保留
             using (var bilateralTemp = new Mat())
             {
                 Cv2.BilateralFilter(processed, bilateralTemp, 9, 150, 150); // 增强空间域滤波
                 bilateralTemp.CopyTo(processed);
             }
-            using (var clahe = Cv2.CreateCLAHE(1.2, new Size(12, 12))) // 降低对比度限制
+            using (var clahe = Cv2.CreateCLAHE(1.2, new Size(12, 12))) // 自适应直方图均衡
             {
                 clahe.Apply(processed, processed);
             }
-            Cv2.ImShow("2. MedianBlur", processed);
-            Cv2.WaitKey(500); // 缩短等待时间
 
-            // ===== 边缘检测优化 =====
-            // 修改点2：动态Canny阈值
+            // ===== [边缘增强阶段] =====
+            // 修改点2：改进的Canny阈值计算
             CalculateCannyThresholds(processed, out double low, out double high, 0.7);
             Cv2.Canny(processed, processed, low, high);
-            Cv2.ImShow("3. Canny", processed);
-            Cv2.WaitKey(0); // 缩短等待时间
+            Cv2.ImShow("2. Canny Edges", processed);
+            Cv2.WaitKey(1000);
 
-            // ===== 形态学优化 =====
-            // 修改点3：精确形态学处理
-            var kernel = Cv2.GetStructuringElement(MorphShapes.Cross, new Size(1, 1)); // 最小化结构元素
-            Cv2.MorphologyEx(processed, processed, MorphTypes.Close, kernel, iterations: 1);
-            Cv2.ImShow("4. MorphologyEx", processed);
-            Cv2.WaitKey(1000); // 缩短等待时间
+            // ===== [线段连接阶段] =====
+            // 修改点3：十字特征定向连接
+            using (var connectedEdges = new Mat())
+            {
+                // 水平方向连接（15像素长度阈值）
+                var hKernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(5, 1));
+                Cv2.MorphologyEx(processed, connectedEdges, MorphTypes.Close, hKernel, iterations: 1);
 
-            // ===== 自适应阈值优化 =====
-            int blockSize = (int)(Math.Max(grayImage.Width, grayImage.Height) * 0.15) | 1;
-            Cv2.AdaptiveThreshold(processed, processed, 255,
-                AdaptiveThresholdTypes.GaussianC,
-                ThresholdTypes.Binary,
-                blockSize,
-                4);
-            Cv2.ImShow("5. AdaptiveThreshold", processed);
-            Cv2.WaitKey(1000); // 缩短等待时间
+                // 垂直方向连接（15像素长度阈值）
+                var vKernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(1, 5));
+                Cv2.MorphologyEx(connectedEdges, connectedEdges, MorphTypes.Close, vKernel, iterations: 1);
 
-            // ===== 轮廓检测优化 =====
-            Cv2.FindContours(processed, out Point[][] contours, out _,
-                RetrievalModes.List, // 改为列表模式获取所有轮廓
-                ContourApproximationModes.ApproxSimple);
+                connectedEdges.CopyTo(processed);
+            }
+            Cv2.ImShow("3. Connected Edges", processed);
+            Cv2.WaitKey(1000);
 
-            List<Point[]> validContours = new List<Point[]>();
-            double imgArea = grayImage.Width * grayImage.Height;
+            // ===== [轮廓提取阶段] =====
+            // 修改点4：使用树形结构保留层级关系
+            Cv2.FindContours(processed, out Point[][] contours, out HierarchyIndex[] hierarchy,
+                RetrievalModes.Tree,  // 重要！保留轮廓层级
+                ContourApproximationModes.ApproxNone); // 保留所有轮廓点
 
+            // ===== [十字特征筛选] =====
+            List<Point[]> crossCandidates = new List<Point[]>();
             foreach (var contour in contours)
             {
-                // 修改点4：智能边界过滤
-                var rect = Cv2.BoundingRect(contour);
-                bool isNearBorder =
-                    rect.X < 5 || rect.Y < 5 ||
-                    rect.X + rect.Width > grayImage.Width - 5 ||
-                    rect.Y + rect.Height > grayImage.Height - 5;
-                if (isNearBorder) continue;
+                // 基础过滤：最小点数限制
+                if (contour.Length < 25) continue; // 修改点5：增加细节要求
 
-                // 修改点5：综合特征过滤
-                double area = Cv2.ContourArea(contour);
-                if (area < 100 || area > imgArea * 0.2) continue; // 绝对面积+相对面积过滤
+                // 计算旋转矩形特征
+                var rotatedRect = Cv2.MinAreaRect(contour);
 
-                // 形状复杂度分析
-                var approx = Cv2.ApproxPolyDP(contour, 0.01 * Cv2.ArcLength(contour, true), true);
-                if (approx.Length < 6 || approx.Length > 20) continue;
+                // 特征1：宽高比过滤（0.8-1.2范围）
+                double aspectRatio = rotatedRect.Size.Width / rotatedRect.Size.Height;
+                if (aspectRatio < 0.8 || aspectRatio > 1.2) continue;
 
-                validContours.Add(contour);
+                // 特征2：中心区域检测
+                var centerROI = new Rect(
+                    (int)(rotatedRect.Center.X - rotatedRect.Size.Width * 0.3),
+                    (int)(rotatedRect.Center.Y - rotatedRect.Size.Height * 0.3),
+                    (int)(rotatedRect.Size.Width * 0.6),
+                    (int)(rotatedRect.Size.Height * 0.6));
+                if (!contour.Any(p => centerROI.Contains(p))) continue;
+
+                // 特征3：辐射状线段检测
+                if (CountRadialLines(contour, rotatedRect.Center) < 3) continue; // 至少3个方向
+
+                crossCandidates.Add(contour);
             }
 
-            // 修改点6：智能评分算法
-            var bestContour = validContours
+            // ===== [最优轮廓选择] =====
+            // 修改点6：多维度评分系统
+            var bestContour = crossCandidates
                 .Select(c => new {
                     Contour = c,
-                    Rect = Cv2.BoundingRect(c),
-                    Area = Cv2.ContourArea(c)
+                    Area = Cv2.ContourArea(c),
+                    LineScore = CountRadialLines(c, Cv2.MinAreaRect(c).Center),
+                    FillRatio = CalculateFillRatio(c)
                 })
-                .Where(x => x.Rect.AspectRatio().Between(0.8, 1.2)) // 宽高比过滤
-                .OrderByDescending(x =>
-                    x.Area * 0.7 + // 面积权重
-                    (1 - Cv2.ContourArea(x.Contour) / x.Rect.Area()) * 0.3) // 填充度权重
-                .Select(x => x.Contour)
-                .FirstOrDefault();
+                .OrderByDescending(x => x.LineScore * 0.5 + x.FillRatio * 0.3 + x.Area * 0.2)
+                .FirstOrDefault()?.Contour;
 
-            // 修改点7：可靠绘制逻辑
+            // ===== [轮廓后处理] =====
+            // 修改点7：强制生成闭合轮廓
             if (bestContour != null)
             {
-                using (var result = grayImage.Clone())
+                // 多边形近似简化轮廓
+                var approx = Cv2.ApproxPolyDP(bestContour,
+                    0.015 * Cv2.ArcLength(bestContour, true),  // 动态epsilon
+                    true);
+
+                // 凸包处理确保闭合性
+                var hull = Cv2.ConvexHull(approx);
+
+                // 最终结果可视化
+                using (var resultVis = grayImage.Clone())
                 {
-                    Cv2.CvtColor(result, result, ColorConversionCodes.GRAY2BGR);
-                    Cv2.DrawContours(result, new[] { bestContour }, -1, Scalar.Red, 2);
+                    Cv2.CvtColor(resultVis, resultVis, ColorConversionCodes.GRAY2BGR);
+                    Cv2.DrawContours(resultVis, new[] { hull }, -1, Scalar.Red, 2);
 
                     // 绘制特征点
-                    foreach (var p in bestContour)
+                    foreach (var p in hull)
                     {
-                        Cv2.Circle(result, p, 2, Scalar.Green, -1);
+                        Cv2.Circle(resultVis, p, 3, Scalar.Green, -1);
                     }
-
-                    Cv2.ImShow("Final Result", result);
-                    Cv2.WaitKey(1000);
+                    Cv2.ImShow("Final Detection", resultVis);
+                    Cv2.WaitKey(0);
                 }
+
+                return new[] { hull };
             }
 
-            return bestContour != null ? new[] { bestContour } : new Point[0][];
+            return new Point[0][];
+        }
+    }
+
+    // 修改点8：辐射状线段计数
+    private static int CountRadialLines(Point[] contour, Point2f center)
+    {
+        const double ANGLE_TOLERANCE = Math.PI / 6; // 30度容差
+        var angleBins = new Dictionary<double, bool>
+    {
+        { 0, false },          // 右
+        { Math.PI/2, false },  // 下
+        { Math.PI, false },    // 左
+        { 3*Math.PI/2, false } // 上
+    };
+
+        foreach (var p in contour)
+        {
+            double dx = p.X - center.X;
+            double dy = p.Y - center.Y;
+            double angle = Math.Atan2(dy, dx);
+            angle = angle < 0 ? angle + 2 * Math.PI : angle; // 转换到0-2π范围
+
+            foreach (var key in angleBins.Keys.ToList())
+            {
+                if (Math.Abs(angle - key) < ANGLE_TOLERANCE ||
+                    Math.Abs(angle - key - 2 * Math.PI) < ANGLE_TOLERANCE)
+                {
+                    angleBins[key] = true;
+                }
+            }
+        }
+
+        return angleBins.Count(pair => pair.Value);
+    }
+
+    // 修改点9：填充率计算
+    private static double CalculateFillRatio(Point[] contour)
+    {
+        var rect = Cv2.BoundingRect(contour);
+        double contourArea = Cv2.ContourArea(contour);
+        double rectArea = rect.Width * rect.Height;
+        return rectArea > 0 ? contourArea / rectArea : 0;
+    }
+
+    // 修改点10：改进的Canny阈值计算
+    private static void CalculateCannyThresholds(Mat gray, out double low, out double high, double percentile = 0.7)
+    {
+        using (var gradX = new Mat())
+        using (var gradY = new Mat())
+        {
+            Cv2.Sobel(gray, gradX, MatType.CV_32F, 1, 0);
+            Cv2.Sobel(gray, gradY, MatType.CV_32F, 0, 1);
+
+            using (var magnitude = new Mat())
+            {
+                Cv2.Magnitude(gradX, gradY, magnitude);
+
+                // 基于百分位的动态阈值
+                double maxVal, medianVal;
+                Cv2.MinMaxLoc(magnitude, out _, out maxVal);
+                medianVal = CalculatePercentile(magnitude, percentile);
+
+                high = Math.Min(maxVal * 0.85, medianVal * 3.2); // 提高高阈值
+                low = high * 0.4; // 保持1:2.5比例
+            }
         }
     }
 
@@ -359,19 +436,6 @@ public class RobustTemplateMatcher
     }
 
     // 修改点13：基于梯度统计的Canny阈值计算
-    private static void CalculateCannyThresholds(Mat gray, out double low, out double high, double percentile = 0.7)
-    {
-        using (var grad = new Mat())
-        {
-            Cv2.Sobel(gray, grad, MatType.CV_32F, 1, 1); // 联合梯度计算
-            Cv2.MinMaxLoc(grad, out _, out double maxGrad);
-
-            // 基于梯度分布的动态阈值
-            double medianGrad = CalculatePercentile(grad, percentile);
-            high = Math.Min(maxGrad * 0.9, medianGrad * 2.8);
-            low = high * 0.45;
-        }
-    }
 
     // 修改点14：百分位数计算方法
     private static double CalculatePercentile(Mat mat, double percentile)
