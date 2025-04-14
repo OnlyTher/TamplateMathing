@@ -152,7 +152,7 @@ public class RobustTemplateMatcher
         using (var gray = new Mat())
         {
             Cv2.CvtColor(roi, gray, ColorConversionCodes.BGR2GRAY);
-            var contours = GetContours(gray);
+            var contours = GetContours(gray, safeRect);
 
             if (contours.Length > 0)
             {
@@ -213,7 +213,7 @@ public class RobustTemplateMatcher
 
 
     #region 核心算法模块
-    private static Point[][] GetContours(Mat grayImage)
+    private static Point[][] GetContours(Mat grayImage, Rect safeRect)
     {
         Cv2.ImShow("1. Original Gray", grayImage);
         Cv2.WaitKey(1000); // 快速调试模式
@@ -221,8 +221,9 @@ public class RobustTemplateMatcher
         using (var validatedImage = Ensure8UC1(grayImage))
         using (var processed = new Mat())
         {
-            // ===== [预处理阶段] =====
-            // 修改点1：优化降噪参数
+            double sizeFactor = Math.Sqrt(safeRect.Area()) / 100.0; // 基准尺寸100x100
+                                                                    // ===== [预处理阶段] =====
+                                                                    // 修改点1：优化降噪参数
             Cv2.MedianBlur(validatedImage, processed, 7);  // 孔径7平衡降噪与细节保留
             using (var bilateralTemp = new Mat())
             {
@@ -245,13 +246,13 @@ public class RobustTemplateMatcher
             // 修改点3：十字特征定向连接
             using (var connectedEdges = new Mat())
             {
-                // 水平方向连接（15像素长度阈值）
-                var hKernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(5, 1));
-                Cv2.MorphologyEx(processed, connectedEdges, MorphTypes.Close, hKernel, iterations: 1);
+                // 水平方向连接（7像素长度阈值）
+                var hKernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(7, 1));
+                Cv2.MorphologyEx(processed, connectedEdges, MorphTypes.Close, hKernel, iterations: 2);
 
-                // 垂直方向连接（15像素长度阈值）
-                var vKernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(1, 5));
-                Cv2.MorphologyEx(connectedEdges, connectedEdges, MorphTypes.Close, vKernel, iterations: 1);
+                // 垂直方向连接（7像素长度阈值）
+                var vKernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(1, 7));
+                Cv2.MorphologyEx(connectedEdges, connectedEdges, MorphTypes.Close, vKernel, iterations: 2);
 
                 connectedEdges.CopyTo(processed);
             }
@@ -268,49 +269,86 @@ public class RobustTemplateMatcher
             List<Point[]> crossCandidates = new List<Point[]>();
             foreach (var contour in contours)
             {
-                // 基础过滤：最小点数限制
-                if (contour.Length < 25) continue; // 修改点5：增加细节要求
+                // 改为基于ROI尺寸的动态阈值
+                int minPoints = (int)(15 * Math.Max(1, sizeFactor)); // 最小点数15~动态调整
+                if (contour.Length < minPoints)
+                {
+                    Console.WriteLine($"轮廓点数不足：{contour.Length}/{minPoints}");
+                    continue;
+                }
 
                 // 计算旋转矩形特征
-                var rotatedRect = Cv2.MinAreaRect(contour);
+                var currentRotatedRect = Cv2.MinAreaRect(contour);
 
                 // 特征1：宽高比过滤（0.8-1.2范围）
-                double aspectRatio = rotatedRect.Size.Width / rotatedRect.Size.Height;
-                if (aspectRatio < 0.8 || aspectRatio > 1.2) continue;
+                double aspectRatio = currentRotatedRect.Size.Width / currentRotatedRect.Size.Height;
+                // 改为尺寸自适应容差
+                double aspectTolerance = 0.3 * (1 + 1 / sizeFactor); // ROI越小容差越大
+                double targetRatio = 1.0;
+                if (Math.Abs(aspectRatio - targetRatio) > aspectTolerance)
+                {
+                    Console.WriteLine($"宽高比超限：{aspectRatio:F2} (容差±{aspectTolerance:F2})");
+                    continue;
+                }
 
-                // 特征2：中心区域检测
+                // 动态中心区域范围
+                double centerRatio = 0.4 - 0.1 * (1 / sizeFactor); // ROI越小检测区域越大
                 var centerROI = new Rect(
-                    (int)(rotatedRect.Center.X - rotatedRect.Size.Width * 0.3),
-                    (int)(rotatedRect.Center.Y - rotatedRect.Size.Height * 0.3),
-                    (int)(rotatedRect.Size.Width * 0.6),
-                    (int)(rotatedRect.Size.Height * 0.6));
-                if (!contour.Any(p => centerROI.Contains(p))) continue;
+                    (int)(currentRotatedRect.Center.X - currentRotatedRect.Size.Width * centerRatio),
+                    (int)(currentRotatedRect.Center.Y - currentRotatedRect.Size.Height * centerRatio),
+                    (int)(currentRotatedRect.Size.Width * centerRatio * 2),
+                    (int)(currentRotatedRect.Size.Height * centerRatio * 2)
+                );
 
-                // 特征3：辐射状线段检测
-                if (CountRadialLines(contour, rotatedRect.Center) < 3) continue; // 至少3个方向
+                // 降低检测密度要求
+                int requiredPoints = (int)(contour.Length * 0.1); // 只需10%的点在中心区
+                if (contour.Count(p => centerROI.Contains(p)) < requiredPoints)
+                {
+                    Console.WriteLine($"中心点不足：{requiredPoints}");
+                    continue;
+                }
+
+                // 动态方向要求
+                int minDirections = sizeFactor < 0.8 ? 2 : 3; // 小ROI只需2个方向
+                if (CountRadialLines(contour, currentRotatedRect.Center) < minDirections)
+                {
+                    Console.WriteLine($"辐射方向不足：{minDirections}");
+                    continue;
+                }
+
+                // 修改角度检测容差（原ANGLE_TOLERANCE）
+                double angleTolerance = Math.PI / (4 + sizeFactor * 2); // ROI越小容差越大
 
                 crossCandidates.Add(contour);
             }
 
             // ===== [最优轮廓选择] =====
             // 修改点6：多维度评分系统
+            // 修改为完整Lambda表达式：
             var bestContour = crossCandidates
-                .Select(c => new {
-                    Contour = c,
-                    Area = Cv2.ContourArea(c),
-                    LineScore = CountRadialLines(c, Cv2.MinAreaRect(c).Center),
-                    FillRatio = CalculateFillRatio(c)
-                })
-                .OrderByDescending(x => x.LineScore * 0.5 + x.FillRatio * 0.3 + x.Area * 0.2)
-                .FirstOrDefault()?.Contour;
-
+               .Select(c =>
+               {
+                   var currentRotatedRect = Cv2.MinAreaRect(c);
+                   return new
+                   {
+                       Contour = c,
+                       SizeScore = 1 / (1 + Math.Exp(-sizeFactor)),
+                       LineScore = CountRadialLines(c, currentRotatedRect.Center) * (2 - sizeFactor),
+                       FillRatio = CalculateFillRatio(c) * 1.2
+                   };
+               })
+               .OrderByDescending(x =>
+                    x.SizeScore * 0.4 +
+                    x.LineScore * 0.3 +
+                    x.FillRatio * 0.3)
+               .FirstOrDefault()?.Contour;
             // ===== [轮廓后处理] =====
             // 修改点7：强制生成闭合轮廓
             if (bestContour != null)
             {
                 // 多边形近似简化轮廓
                 var approx = Cv2.ApproxPolyDP(bestContour,
-                    0.015 * Cv2.ArcLength(bestContour, true),  // 动态epsilon
+                    0.005 * Cv2.ArcLength(bestContour, true),  // 动态epsilon
                     true);
 
                 // 凸包处理确保闭合性
@@ -320,7 +358,9 @@ public class RobustTemplateMatcher
                 using (var resultVis = grayImage.Clone())
                 {
                     Cv2.CvtColor(resultVis, resultVis, ColorConversionCodes.GRAY2BGR);
-                    Cv2.DrawContours(resultVis, new[] { hull }, -1, Scalar.Red, 2);
+                    // 修改为明确指定嵌套层级：
+                    var contoursToDraw = new Point[][] { hull }; // 创建二维数组
+                    Cv2.DrawContours(resultVis, contoursToDraw, -1, Scalar.Red, 2);
 
                     // 绘制特征点
                     foreach (var p in hull)
