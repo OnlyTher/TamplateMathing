@@ -221,6 +221,13 @@ public class RobustTemplateMatcher
         try
         {
             hullIndices = Cv2.ConvexHullIndices(contour, clockwise: true);
+
+            if (!IsValidHullIndices(hullIndices, contour.Length))
+            {
+                Console.WriteLine("无效的凸包索引");
+                return new Point[0];
+            }
+
             if (hullIndices.Length < 4) // 凸包至少需要4个点
             {
                 Console.WriteLine($"无效凸包点数：{hullIndices.Length}");
@@ -290,6 +297,13 @@ public class RobustTemplateMatcher
             .Take(4)
             .Select(p => p.Point)
             .ToArray();
+    }
+
+    private static bool IsValidHullIndices(int[] hullIndices, int contourLength)
+    {
+        if (hullIndices.Length < 3) return false;
+        return hullIndices.All(idx => idx >= 0 && idx < contourLength) &&
+               hullIndices.SequenceEqual(hullIndices.OrderBy(x => x));
     }
 
     // 新增：计算轮廓点的内角
