@@ -210,10 +210,10 @@ public class RobustTemplateMatcher
     private static Point[] DetectConcavePoints(Point[] contour)
     {
         // 参数校验增强
-        if (contour.Length < 40) // 降低最小轮廓长度要求
+        if (contour == null || contour.Length < 40) // 降低最小轮廓长度要求
         {
-            Console.WriteLine($"轮廓过短：{contour.Length}点");
-            return new Point[0];
+            Console.WriteLine($"轮廓过短：{contour?.Length ?? 0}点");
+            return Array.Empty<Point>();
         }
 
         // 获取凸包索引时增加异常处理
@@ -222,77 +222,97 @@ public class RobustTemplateMatcher
         {
             hullIndices = Cv2.ConvexHullIndices(contour, clockwise: true);
 
+            // 新增凸包索引验证
             if (!IsValidHullIndices(hullIndices, contour.Length))
             {
                 Console.WriteLine("无效的凸包索引");
-                return new Point[0];
+                return Array.Empty<Point>();
             }
 
             if (hullIndices.Length < 4) // 凸包至少需要4个点
             {
                 Console.WriteLine($"无效凸包点数：{hullIndices.Length}");
-                return new Point[0];
+                return Array.Empty<Point>();
             }
         }
         catch (Exception ex)
         {
             Console.WriteLine($"凸包计算异常：{ex.Message}");
-            return new Point[0];
+            return Array.Empty<Point>();
         }
 
-        // 关键修复：正确解析凸包缺陷参数
+        // 计算凸性缺陷
         var defects = Cv2.ConvexityDefects(contour, hullIndices);
         if (defects == null || defects.Length == 0)
         {
             Console.WriteLine("未检测到凸包缺陷");
-            return new Point[0];
+            return Array.Empty<Point>();
         }
 
+        // 调试输出
         Console.WriteLine($"发现凸包缺陷数量：{defects.Length}");
         foreach (var d in defects.Take(3))
         {
             Console.WriteLine($"缺陷数据：[{d[0]},{d[1]},{d[2]},{d[3]}]");
         }
 
-        // 动态参数计算优化
+        // 动态参数计算
         double contourArea = Cv2.ContourArea(contour);
-        double sizeFactor = Math.Sqrt(contourArea) / 20.0; // 基于面积计算尺寸因子
+        double sizeFactor = Math.Sqrt(contourArea) / 20.0;
 
+        // 统一匿名类型定义
         return defects
             .Select(d =>
             {
-                // 关键索引修正：
-                // [0] = startIndex
-                // [1] = endIndex
-                // [2] = farIndex (凹点位置)
-                // [3] = depth (需要除以256得到像素值)
-                int farIndex = (int)d[2];
-                float depth = (float)d[3] / 256; // OpenCV深度值修正
-
-                return new
+                // 定义统一返回类型
+                var errorResult = new
                 {
-                    Point = contour[farIndex], // 使用farIndex获取凹点位置
-                    Depth = depth,
-                    Angle = CalculateAngleAtPoint(contour, farIndex)
+                    Valid = false,
+                    Point = new Point(0, 0),
+                    Depth = 0f,
+                    Angle = 0.0
                 };
+
+                try
+                {
+                    // 解析缺陷参数
+                    int farIndex = (int)d[2];
+
+                    // 索引有效性验证
+                    if (farIndex < 0 || farIndex >= contour.Length)
+                    {
+                        Console.WriteLine($"跳过无效索引：{farIndex}/{contour.Length}");
+                        return errorResult;
+                    }
+
+                    // 计算动态阈值
+                    float depth = (float)d[3] / 256;
+                    double depthThreshold = 3.0 + sizeFactor * 2;
+                    double angleThreshold = Math.PI * 0.45;
+
+                    // 计算角度特征
+                    double angle = CalculateAngleAtPoint(contour, farIndex);
+
+                    // 验证条件
+                    bool validDepth = depth > depthThreshold;
+                    bool validAngle = angle > angleThreshold;
+                    bool isEdge = IsEdgePoint(contour[farIndex], contour);
+
+                    return new
+                    {
+                        Valid = validDepth && validAngle && !isEdge,
+                        Point = contour[farIndex],
+                        Depth = depth,
+                        Angle = angle
+                    };
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"处理缺陷时发生异常：{ex.Message}");
+                    return errorResult;
+                }
             })
-            .Where(p =>
-            {
-                // 动态阈值优化
-                double depthThreshold = 3.0 + sizeFactor * 2; // 基础3px + 尺寸补偿
-                bool validDepth = p.Depth > depthThreshold;
-
-                // 角度筛选优化
-                bool validAngle = p.Angle > Math.PI * 0.45; // 108度
-
-                // 边缘点过滤
-                bool isEdge = IsEdgePoint(p.Point, contour);
-
-                // 调试输出
-                Console.WriteLine($"候选点({p.Point.X},{p.Point.Y}) 深度:{p.Depth:F1} 角度:{p.Angle * 180 / Math.PI:F0}° 有效:{validDepth & validAngle & !isEdge}");
-
-                return validDepth && validAngle && !isEdge;
-            })
+            .Where(p => p.Valid) // 显式过滤有效点
             .OrderByDescending(p => p.Depth)
             .Take(4)
             .Select(p => p.Point)
@@ -309,9 +329,20 @@ public class RobustTemplateMatcher
     // 新增：计算轮廓点的内角
     private static double CalculateAngleAtPoint(Point[] contour, int index)
     {
+
+        // 新增防御性校验
+        if (contour == null || contour.Length == 0)
+        {
+            Console.WriteLine("错误：空轮廓输入");
+            return 0;
+        }
+
         const int window = 3; // 检查前后3个点的平均方向
         Vector2 prevDirSum = new Vector2();
         Vector2 nextDirSum = new Vector2();
+
+        // 安全索引计算（核心修复）
+        int safeIndex(int i) => (i % contour.Length + contour.Length) % contour.Length;
 
         for (int i = -window; i <= window; i++)
         {
@@ -418,7 +449,7 @@ public class RobustTemplateMatcher
     private static Point[][] GetContours(Mat grayImage, Rect safeRect)
     {
         Cv2.ImShow("1. Original Gray", grayImage);
-        Cv2.WaitKey(1000); // 快速调试模式
+        Cv2.WaitKey(50); // 快速调试模式
 
         using (var validatedImage = Ensure8UC1(grayImage))
         using (var processed = new Mat())
@@ -442,7 +473,7 @@ public class RobustTemplateMatcher
             CalculateCannyThresholds(processed, out double low, out double high, 0.7);
             Cv2.Canny(processed, processed, low, high);
             Cv2.ImShow("2. Canny Edges", processed);
-            Cv2.WaitKey(1000);
+            Cv2.WaitKey(50);
 
             // ===== [线段连接阶段] =====
             // 修改点3：十字特征定向连接
@@ -459,7 +490,7 @@ public class RobustTemplateMatcher
                 connectedEdges.CopyTo(processed);
             }
             Cv2.ImShow("3. Connected Edges", processed);
-            Cv2.WaitKey(1000);
+            Cv2.WaitKey(50);
 
             // ===== [轮廓提取阶段] =====
             // 修改点4：使用树形结构保留层级关系
