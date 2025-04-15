@@ -7,7 +7,7 @@ using OpenCvSharp;
 public class RobustTemplateMatcher
 {
     // 配置参数
-    private const double DefaultConfidenceThreshold = 0.75;
+    private const double DefaultConfidenceThreshold = 0.45;
     private const int MinTemplateSize = 20;
     private const int MorphologySize = 3;
     private const int MorphologyIterations = 2;
@@ -162,6 +162,29 @@ public class RobustTemplateMatcher
             {
                 var mainContour = contours.First();
 
+                // ==== 新增：计算并绘制中心点 ====
+                // 计算轮廓中心（局部坐标系）
+                Point localCenter = CalculateContourCenter(mainContour);
+
+                // 转换为全局坐标
+                Point globalCenter = new Point(
+                    localCenter.X + safeRect.X,
+                    localCenter.Y + safeRect.Y
+                );
+
+                // 绘制正十字标记（绿色十字，尺寸自适应）
+                int crossSize = (int)(Math.Max(template.Width, template.Height) * 0.03); // 15%的模板尺寸
+                Cv2.Line(src,
+                    new Point(globalCenter.X - crossSize, globalCenter.Y),
+                    new Point(globalCenter.X + crossSize, globalCenter.Y),
+                    Scalar.FromRgb(0, 255, 0),  // 亮绿色
+                    2);                          // 线宽
+                Cv2.Line(src,
+                    new Point(globalCenter.X, globalCenter.Y - crossSize),
+                    new Point(globalCenter.X, globalCenter.Y + crossSize),
+                    Scalar.FromRgb(0, 255, 0),
+                    2);
+
                 // 亚像素级轮廓优化（保留凹点）
                 var preciseContour = RefineContour(mainContour, gray);
 
@@ -173,33 +196,10 @@ public class RobustTemplateMatcher
                     .Select(p => new Point(p.X + safeRect.X, p.Y + safeRect.Y))
                     .ToArray();
 
+
                 // 绘制完整轮廓（红色）
                 Cv2.Polylines(src, new[] { globalContour }, true, Scalar.Red, 2);
 
-                foreach (var localPoint in concavePoints)
-                {
-                    // 转换为全局坐标
-                    var globalPoint = new Point(
-                        localPoint.X + safeRect.X,
-                        localPoint.Y + safeRect.Y);
-
-                    // 绘制绿色实心圆（增大显示尺寸）
-                    Cv2.Circle(src, globalPoint, 8, Scalar.Green, -1);
-
-                    // 在凹点中心添加黑色小圆增强可视性
-                    Cv2.Circle(src, globalPoint, 2, Scalar.Black, -1);
-                }
-
-                // 质量评估（新增凹点评分）
-                double quality = CalculateContourQuality(globalContour);
-                Cv2.PutText(src, $"Quality: {quality:0.00}",
-                    new Point(10, 30), HersheyFonts.HersheySimplex,
-                    0.8, quality > 0.7 ? Scalar.Green : Scalar.Red, 2);
-
-
-                // 在DrawOptimizedResult中添加调试输出：
-                //Console.WriteLine($"优化后轮廓点数：{globalContour.Length}");
-               // Console.WriteLine($"凹点坐标：{string.Join(" ", concavePoints.Select(p => $"({p.X},{p.Y})"))}");
             }
         }
     }
@@ -388,7 +388,7 @@ public class RobustTemplateMatcher
         var smoothed = SmoothContour(mergedPoints.Select(p => new Point((int)p.X, (int)p.Y)).ToArray());
 
         // 步骤4：凹点补偿多边形近似
-        double epsilon = 0.001 * Cv2.ArcLength(smoothed, true); // 提高精度
+        double epsilon = 0.002 * Cv2.ArcLength(smoothed, true); // 提高精度
         var approx = Cv2.ApproxPolyDP(smoothed, epsilon, true);
 
         // 最终轮廓 = 近似结果 + 原始凹点（双重保障）
@@ -434,12 +434,12 @@ public class RobustTemplateMatcher
             // 修改点3：十字特征定向连接
             using (var connectedEdges = new Mat())
             {
-                // 水平方向连接（7像素长度阈值）
-                var hKernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(7, 1));
+                // 水平方向连接（4像素长度阈值）
+                var hKernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(6, 1));
                 Cv2.MorphologyEx(processed, connectedEdges, MorphTypes.Close, hKernel, iterations: 2);
 
-                // 垂直方向连接（7像素长度阈值）
-                var vKernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(1, 7));
+                // 垂直方向连接（5像素长度阈值）
+                var vKernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(1, 5));
                 Cv2.MorphologyEx(connectedEdges, connectedEdges, MorphTypes.Close, vKernel, iterations: 2);
 
                 connectedEdges.CopyTo(processed);
@@ -729,7 +729,7 @@ public class RobustTemplateMatcher
     private static Point[] SmoothContour(Point[] contour)
     {
         List<Point> smoothed = new List<Point>();
-        const double step = 0.05; // 高密度插值
+        const double step = 0.07; // 高密度插值
 
         for (int i = 0; i < contour.Length; i++)
         {
