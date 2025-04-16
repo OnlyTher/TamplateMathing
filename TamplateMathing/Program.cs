@@ -393,26 +393,6 @@ public class RobustTemplateMatcher
                index > contour.Length - edgeThreshold;
     }
 
-    private static double CalculateContourQuality(IEnumerable<Point> contour)
-    {
-        // 综合质量评估（0-1）
-        var points = contour.ToArray();
-
-        // 凸性检测
-        double hullArea = Cv2.ContourArea(Cv2.ConvexHull(points));
-        double contourArea = Cv2.ContourArea(points);
-        double convexity = contourArea / hullArea;
-
-        // 角度一致性
-        double angleVariance = CalculateAngleVariance(points);
-
-        // 矩形匹配度
-        var rect = Cv2.BoundingRect(points);
-        double rectMatch = contourArea / rect.Area();
-
-        return (convexity * 0.6 + (1 - angleVariance) * 0.3 + rectMatch * 0.1);
-    }
-
     // 修改 RefineContour 方法（保留凹点关键修改）
     private static Point[] RefineContour(Point[] contour, Mat gray)
     {
@@ -703,50 +683,6 @@ public class RobustTemplateMatcher
         }
     }
 
-    //计算中值
-    private static double CalculateMedian(Mat gray)
-    {
-        if (gray.Empty() || gray.Channels() != 1 || gray.Type() != MatType.CV_8UC1)
-            return 0;
-
-        using (var continuousMat = gray.Clone())
-        using (var mat = continuousMat.Reshape(0, 1))
-        {
-            long total = mat.Total();
-            if (total == 0) return 0;
-
-            // 使用Marshal安全复制数据
-            var sorted = new byte[total];
-            System.Runtime.InteropServices.Marshal.Copy(
-                source: mat.Data,
-                destination: sorted,
-                startIndex: 0,
-                length: (int)total);
-
-            Array.Sort(sorted);
-            int mid = sorted.Length / 2;
-            return (sorted.Length % 2 != 0) ?
-                sorted[mid] :
-                (sorted[mid - 1] + sorted[mid]) / 2.0;
-        }
-    }
-
-    private static double CalculateContourScore(Point[] contour, Rect roiArea)
-    {
-        // 形状匹配度（0-1，越接近1越好）
-        var approx = Cv2.ApproxPolyDP(contour, 0.02 * Cv2.ArcLength(contour, true), true);
-        double areaRatio = Cv2.ContourArea(contour) / roiArea.Area();
-
-        // 矩形匹配度
-        var rect = Cv2.BoundingRect(contour);
-        double rectMatch = Cv2.ContourArea(contour) / rect.Area();
-
-        // 角度一致性
-        double angleConsistency = 1 - CalculateAngleVariance(approx);
-
-        // 综合评分（可调整权重）
-        return rectMatch * 0.6 + angleConsistency * 0.3 + areaRatio * 0.1;
-    }
 
     private static double CalculateAngleVariance(Point[] approx)
     {
