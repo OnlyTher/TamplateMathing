@@ -435,38 +435,40 @@ public class RobustTemplateMatcher
         using (var processed = new Mat())
         {
             double sizeFactor = Math.Sqrt(safeRect.Area()) / 100.0; // 基准尺寸100x100
-                                                                    // ===== [预处理阶段] =====
-                                                                    // 修改点1：优化降噪参数
-            Cv2.MedianBlur(validatedImage, processed, 7);  // 孔径7平衡降噪与细节保留
+
+            Cv2.MedianBlur(validatedImage, processed, 7);  // 孔径7-》5平衡降噪与细节保留
+
             using (var bilateralTemp = new Mat())
             {
-                Cv2.BilateralFilter(processed, bilateralTemp, 9, 150, 150); // 增强空间域滤波
+                Cv2.BilateralFilter(processed, bilateralTemp, 7, 120, 120); // 增强空间域滤波
                 bilateralTemp.CopyTo(processed);
             }
-            using (var clahe = Cv2.CreateCLAHE(1.2, new Size(12, 12))) // 自适应直方图均衡
-            {
-                clahe.Apply(processed, processed);
-            }
-
+            //using (var clahe = Cv2.CreateCLAHE(1.2, new Size(12, 12))) // 自适应直方图均衡
+            //{
+            //    clahe.Apply(processed, processed);
+            //}
+            //Cv2.ImShow("1.B CreateCLAHE", processed);
+            //Cv2.WaitKey(0); // 快速调试模式
             // ===== [边缘增强阶段] =====
             // 修改点2：改进的Canny阈值计算
             CalculateCannyThresholds(processed, out double low, out double high, 0.7);
             Cv2.Canny(processed, processed, low, high);
             Cv2.ImShow("2. Canny Edges", processed);
-            Cv2.WaitKey(50);
+            Cv2.WaitKey(1000);
 
             // ===== [线段连接阶段] =====
             // 修改点3：十字特征定向连接
             using (var connectedEdges = new Mat())
             {
-                // 水平方向连接（4像素长度阈值）
-                var hKernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(6, 1));
-                Cv2.MorphologyEx(processed, connectedEdges, MorphTypes.Close, hKernel, iterations: 2);
+                // 使用旋转矩形核进行多方向连接
+                var rotatedKernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(3, 7));
+                Cv2.MorphologyEx(processed, connectedEdges, MorphTypes.Close, rotatedKernel, iterations: 1);
+                Cv2.Rotate(rotatedKernel, rotatedKernel, RotateFlags.Rotate90Clockwise);
+                Cv2.MorphologyEx(connectedEdges, connectedEdges, MorphTypes.Close, rotatedKernel, iterations: 1);
 
-                // 垂直方向连接（5像素长度阈值）
-                var vKernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(1, 5));
-                Cv2.MorphologyEx(connectedEdges, connectedEdges, MorphTypes.Close, vKernel, iterations: 2);
-
+                // 最终使用交叉核强化连接
+                var crossKernel = Cv2.GetStructuringElement(MorphShapes.Cross, new Size(5, 5));
+                Cv2.MorphologyEx(connectedEdges, connectedEdges, MorphTypes.Close, crossKernel, iterations: 2);
                 connectedEdges.CopyTo(processed);
             }
             Cv2.ImShow("3. Connected Edges", processed);
@@ -483,7 +485,7 @@ public class RobustTemplateMatcher
             foreach (var contour in contours)
             {
                 // 改为基于ROI尺寸的动态阈值
-                int minPoints = (int)(15 * Math.Max(1, sizeFactor)); // 最小点数15~动态调整
+                int minPoints = (int)(20 * Math.Max(1, sizeFactor)); // 最小点数15~动态调整
                 if (contour.Length < minPoints)
                 {
                     Console.WriteLine($"轮廓点数不足：{contour.Length}/{minPoints}");
@@ -504,7 +506,7 @@ public class RobustTemplateMatcher
                     continue;
                 }
 
-                // 动态中心区域范围
+                // 动态中心区域范围 0.4
                 double centerRatio = 0.4 - 0.1 * (1 / sizeFactor); // ROI越小检测区域越大
                 var centerROI = new Rect(
                     (int)(currentRotatedRect.Center.X - currentRotatedRect.Size.Width * centerRatio),
@@ -514,15 +516,15 @@ public class RobustTemplateMatcher
                 );
 
                 // 降低检测密度要求
-                int requiredPoints = (int)(contour.Length * 0.1); // 只需10%的点在中心区
+                int requiredPoints = (int)(contour.Length * 0.15); // 只需10%的点在中心区
                 if (contour.Count(p => centerROI.Contains(p)) < requiredPoints)
                 {
                     Console.WriteLine($"中心点不足：{requiredPoints}");
                     continue;
                 }
 
-                // 动态方向要求
-                int minDirections = sizeFactor < 0.8 ? 2 : 3; // 小ROI只需2个方向
+                // 动态方向要求 2：3
+                int minDirections = sizeFactor < 0.8 ? 3 : 4; // 小ROI只需2个方向
                 if (CountRadialLines(contour, currentRotatedRect.Center) < minDirections)
                 {
                     Console.WriteLine($"辐射方向不足：{minDirections}");
@@ -537,26 +539,26 @@ public class RobustTemplateMatcher
 
             // ===== [最优轮廓选择] =====
             // 修改点6：多维度评分系统
-            // 修改为完整Lambda表达式：
             var bestContour = crossCandidates
-               .Select(c =>
-               {
-                   var currentRotatedRect = Cv2.MinAreaRect(c);
-                   return new
-                   {
-                       Contour = c,
-                       SizeScore = 1 / (1 + Math.Exp(-sizeFactor)),
-                       LineScore = CountRadialLines(c, currentRotatedRect.Center) * (2 - sizeFactor),
-                       FillRatio = CalculateFillRatio(c) * 1.2
-                   };
-               })
-               .OrderByDescending(x =>
-                    x.SizeScore * 0.4 +
-                    x.LineScore * 0.3 +
-                    x.FillRatio * 0.3)
-               .FirstOrDefault()?.Contour;
+                .Select(c =>
+                {
+                    var rotatedRect = Cv2.MinAreaRect(c);
+                    return new
+                    {
+                        Contour = c,
+                        Compactness = 4 * Math.PI * Cv2.ContourArea(c) / Math.Pow(Cv2.ArcLength(c, true), 2),
+                        LineScore = CountRadialLines(c, rotatedRect.Center) * 1.5,
+                        AngleConsistency = 1 / (1 + CalculateAngleVariance(c))
+                    };
+                })
+                .OrderByDescending(x =>
+                    x.Compactness * 0.4 +
+                    x.LineScore * 0.4 +
+                    x.AngleConsistency * 0.2)
+                .FirstOrDefault()?.Contour;
+
             // ===== [轮廓后处理] =====
-            // 修改点7：强制生成闭合轮廓
+            // 强制生成闭合轮廓
             if (bestContour != null)
             {
                 // 多边形近似简化轮廓
@@ -574,7 +576,7 @@ public class RobustTemplateMatcher
     // 修改点8：辐射状线段计数
     private static int CountRadialLines(Point[] contour, Point2f center)
     {
-        const double ANGLE_TOLERANCE = Math.PI / 6; // 30度容差
+        const double ANGLE_TOLERANCE = Math.PI / 8; // 收紧角度容差
         var angleBins = new Dictionary<double, bool>
     {
         { 0, false },          // 右
@@ -583,19 +585,25 @@ public class RobustTemplateMatcher
         { 3*Math.PI/2, false } // 上
     };
 
-        foreach (var p in contour)
+        // 增加采样密度
+        foreach (var p in contour.Where((_, i) => i % 5 == 0))
         {
             double dx = p.X - center.X;
             double dy = p.Y - center.Y;
+            if (Math.Abs(dx) < 2 && Math.Abs(dy) < 2) continue; // 忽略中心点
+
             double angle = Math.Atan2(dy, dx);
-            angle = angle < 0 ? angle + 2 * Math.PI : angle; // 转换到0-2π范围
+            angle = (angle + 2 * Math.PI) % (2 * Math.PI);
 
             foreach (var key in angleBins.Keys.ToList())
             {
-                if (Math.Abs(angle - key) < ANGLE_TOLERANCE ||
-                    Math.Abs(angle - key - 2 * Math.PI) < ANGLE_TOLERANCE)
+                double diff = Math.Abs(angle - key);
+                diff = Math.Min(diff, 2 * Math.PI - diff);
+
+                if (diff < ANGLE_TOLERANCE)
                 {
                     angleBins[key] = true;
+                    break; // 避免重复计数
                 }
             }
         }
@@ -630,7 +638,7 @@ public class RobustTemplateMatcher
                 Cv2.MinMaxLoc(magnitude, out _, out maxVal);
                 medianVal = CalculatePercentile(magnitude, percentile);
 
-                high = Math.Min(maxVal * 0.85, medianVal * 3.2); // 提高高阈值
+                high = Math.Min(maxVal * 0.8, medianVal * 3.4); // 提高高阈值
                 low = high * 0.4; // 保持1:2.5比例
             }
         }
