@@ -154,17 +154,21 @@ public class RobustTemplateMatcher
         {
             Cv2.CvtColor(roi, gray, ColorConversionCodes.BGR2GRAY);
             var contours = GetContours(gray, safeRect);
-
             // ==== 新增调试输出1 ====
             Console.WriteLine($"发现轮廓数量：{contours.Length}");
 
-            if (contours.Length > 0)
+            var bestContour = contours
+            .OrderBy(c => CalculateCompactness(c))
+            .FirstOrDefault();
+
+
+
+            if (bestContour != null)
             {
-                var mainContour = contours.First();
 
                 // ==== 新增：计算并绘制中心点 ====
                 // 计算轮廓中心（局部坐标系）
-                Point localCenter = CalculateContourCenter(mainContour);
+                Point localCenter = CalculateContourCenter(bestContour);
 
                 // 转换为全局坐标
                 Point globalCenter = new Point(
@@ -185,20 +189,26 @@ public class RobustTemplateMatcher
                     Scalar.FromRgb(0, 255, 0),
                     2);
 
-                // 亚像素级轮廓优化（保留凹点）
-                var preciseContour = RefineContour(mainContour, gray);
-
-                // 凹点检测增强
-                var concavePoints = DetectConcavePoints(preciseContour);
-
-                // 转换坐标系
-                var globalContour = preciseContour
+                // ==== 优化轮廓 ====
+                var preciseContour = RefineContour(bestContour, gray)
                     .Select(p => new Point(p.X + safeRect.X, p.Y + safeRect.Y))
                     .ToArray();
 
+                // ==== 关键修改：确保只绘制一个轮廓 ====
+                if (preciseContour.Length > 2) // 确保是有效多边形
+                {
 
-                // 绘制完整轮廓（红色）
-                Cv2.Polylines(src, new[] { globalContour }, true, Scalar.Red, 2);
+                    // 使用单一轮廓绘制模式
+                    Cv2.DrawContours(
+                        image: src,
+                        contours: new[] { preciseContour },
+                        contourIdx: 0,
+                        color: Scalar.Red,
+                        thickness: 2,
+                        lineType: LineTypes.AntiAlias);
+
+                    Console.WriteLine($"最终轮廓点数：{preciseContour.Length}，首点：{preciseContour[0]}");
+                }
 
             }
         }
@@ -342,7 +352,7 @@ public class RobustTemplateMatcher
         Vector2 nextDirSum = new Vector2();
 
         // 安全索引计算（核心修复）
-        int safeIndex(int i) => (i % contour.Length + contour.Length) % contour.Length;
+        //int safeIndex(int i) => (i % contour.Length + contour.Length) % contour.Length;
 
         for (int i = -window; i <= window; i++)
         {
@@ -417,11 +427,7 @@ public class RobustTemplateMatcher
         var approx = Cv2.ApproxPolyDP(smoothed, epsilon, true);
 
         // 最终轮廓 = 近似结果 + 原始凹点（双重保障）
-        return approx
-            .Concat(concaveAnchors.Select(p => new Point((int)p.X, (int)p.Y)))
-            .GroupBy(p => new { p.X, p.Y })
-            .Select(g => g.First())
-            .ToArray();
+        return approx;
     }
 
 
@@ -454,14 +460,14 @@ public class RobustTemplateMatcher
             CalculateCannyThresholds(processed, out double low, out double high, 0.7);
             Cv2.Canny(processed, processed, low, high);
             Cv2.ImShow("2. Canny Edges", processed);
-            Cv2.WaitKey(1000);
+            Cv2.WaitKey(50);
 
             // ===== [线段连接阶段] =====
             // 修改点3：十字特征定向连接
             using (var connectedEdges = new Mat())
             {
                 // 使用旋转矩形核进行多方向连接
-                var rotatedKernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(3, 7));
+                var rotatedKernel = Cv2.GetStructuringElement(MorphShapes.Rect, new Size(3, 6));
                 Cv2.MorphologyEx(processed, connectedEdges, MorphTypes.Close, rotatedKernel, iterations: 1);
                 Cv2.Rotate(rotatedKernel, rotatedKernel, RotateFlags.Rotate90Clockwise);
                 Cv2.MorphologyEx(connectedEdges, connectedEdges, MorphTypes.Close, rotatedKernel, iterations: 1);
@@ -538,24 +544,10 @@ public class RobustTemplateMatcher
             }
 
             // ===== [最优轮廓选择] =====
-            // 修改点6：多维度评分系统
             var bestContour = crossCandidates
-                .Select(c =>
-                {
-                    var rotatedRect = Cv2.MinAreaRect(c);
-                    return new
-                    {
-                        Contour = c,
-                        Compactness = 4 * Math.PI * Cv2.ContourArea(c) / Math.Pow(Cv2.ArcLength(c, true), 2),
-                        LineScore = CountRadialLines(c, rotatedRect.Center) * 1.5,
-                        AngleConsistency = 1 / (1 + CalculateAngleVariance(c))
-                    };
-                })
-                .OrderByDescending(x =>
-                    x.Compactness * 0.4 +
-                    x.LineScore * 0.4 +
-                    x.AngleConsistency * 0.2)
-                .FirstOrDefault()?.Contour;
+                .OrderBy(c => CalculateCompactness(c))  // 按紧凑度排序
+                .ThenBy(c => GetDistance(Cv2.BoundingRect(c).GetCenter(), _selectedROI.GetCenter()))
+                .FirstOrDefault();  // 强制取第一个
 
             // ===== [轮廓后处理] =====
             // 强制生成闭合轮廓
@@ -571,6 +563,90 @@ public class RobustTemplateMatcher
 
             return new Point[0][];
         }
+    }
+
+    private static Point[] GetBestContour(IEnumerable<Point[]> candidates)
+    {
+        return candidates?
+            .Select(c => new
+            {
+                Contour = c,
+                Compactness = CalculateCompactness(c),
+                Center = Cv2.BoundingRect(c).GetCenter(),
+                AspectRatio = Cv2.BoundingRect(c).AspectRatio()
+            })
+            .OrderBy(x => x.Compactness)          // 优先选择更紧凑的
+            .ThenBy(x => GetDistance(x.Center, _selectedROI.GetCenter())) // 其次选择更近的
+            .ThenBy(x => Math.Abs(1.0 - x.AspectRatio)) // 最后选择更方的
+            .Select(x => x.Contour)
+            .FirstOrDefault();
+    }
+
+    // 添加紧凑度计算（放在类中）
+    private static double CalculateCompactness(Point[] contour)
+    {
+        double perimeter = Cv2.ArcLength(contour, true);
+        double area = Cv2.ContourArea(contour);
+        return area > 0 ? Math.Pow(perimeter, 2) / (4 * Math.PI * area) : double.MaxValue;
+    }
+
+    private static double GetDistance(Point2f p1, Point2f p2)
+    {
+        return Math.Sqrt(Math.Pow(p1.X - p2.X, 2) + Math.Pow(p1.Y - p2.Y, 2));
+    }
+
+    // 新增线一致性计算方法
+    private static double CalculateLineConsistency(Point[] contour)
+    {
+        const int LINE_LENGTH_THRESHOLD = 10; // 最小线段长度
+        List<double> angles = new List<double>();
+
+        // 使用Douglas-Peucker算法简化轮廓
+        var simplified = Cv2.ApproxPolyDP(contour, 0.01 * Cv2.ArcLength(contour, true), true);
+
+        // 检测直线段
+        for (int i = 0; i < simplified.Length; i++)
+        {
+            Point p1 = simplified[i];
+            Point p2 = simplified[(i + 1) % simplified.Length];
+
+            double length = Math.Sqrt(Math.Pow(p2.X - p1.X, 2) + Math.Pow(p2.Y - p1.Y, 2));
+            if (length < LINE_LENGTH_THRESHOLD) continue;
+
+            double angle = Math.Atan2(p2.Y - p1.Y, p2.X - p1.X);
+            angles.Add(angle);
+        }
+
+        // 计算主方向一致性
+        if (angles.Count < 4) return 0;
+
+        // 寻找四个主要方向（0°, 90°, 180°, 270°）
+        double[] targetAngles = { 0, Math.PI / 2, Math.PI, 3 * Math.PI / 2 };
+        int matchedDirections = 0;
+
+        foreach (var target in targetAngles)
+        {
+            if (angles.Any(a => Math.Abs(a - target) < Math.PI / 8))
+                matchedDirections++;
+        }
+
+        return (double)matchedDirections / 4;
+    }
+
+    // 新增对称性计算
+    private static double CalculateSymmetry(Point[] contour)
+    {
+        var rect = Cv2.BoundingRect(contour);
+        Point center = new Point(rect.X + rect.Width / 2, rect.Y + rect.Height / 2);
+
+        int symmetryCount = 0;
+        foreach (var p in contour)
+        {
+            Point mirror = new Point(2 * center.X - p.X, 2 * center.Y - p.Y);
+            if (contour.Any(cp => Math.Abs(cp.X - mirror.X) < 2 && Math.Abs(cp.Y - mirror.Y) < 2))
+                symmetryCount++;
+        }
+        return (double)symmetryCount / contour.Length;
     }
 
     // 修改点8：辐射状线段计数
@@ -855,5 +931,11 @@ public static class Extensions
         if (list.Count == 0) return 0;
         double mean = list.Average();
         return list.Average(v => Math.Pow(v - mean, 2));
+    }
+
+    // 扩展方法（添加到Extensions类）
+    public static Point2f GetCenter(this Rect rect)
+    {
+        return new Point2f(rect.X + rect.Width / 2f, rect.Y + rect.Height / 2f);
     }
 }
