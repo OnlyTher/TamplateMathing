@@ -77,7 +77,6 @@ public class RobustTemplateMatcher
                          $"\n失败图像：{Path.GetFullPath(_failureDir)}");
     }
 
-
     private static bool SelectTemplate()
     {
         const string windowName = "选择模板区域 (拖拽选择，ENTER确认)";
@@ -161,8 +160,6 @@ public class RobustTemplateMatcher
             .OrderBy(c => CalculateCompactness(c))
             .FirstOrDefault();
 
-
-
             if (bestContour != null)
             {
 
@@ -194,10 +191,15 @@ public class RobustTemplateMatcher
                     .Select(p => new Point(p.X + safeRect.X, p.Y + safeRect.Y))
                     .ToArray();
 
+                if (preciseContour.Length > 1)
+                {
+                    // 精确对齐首尾点（无误差补偿）
+                    preciseContour[preciseContour.Length  - 1] = preciseContour[0];
+                }
+
                 // ==== 关键修改：确保只绘制一个轮廓 ====
                 if (preciseContour.Length > 2) // 确保是有效多边形
                 {
-
                     // 使用单一轮廓绘制模式
                     Cv2.DrawContours(
                         image: src,
@@ -207,173 +209,15 @@ public class RobustTemplateMatcher
                         thickness: 2,
                         lineType: LineTypes.AntiAlias);
 
-                    Console.WriteLine($"最终轮廓点数：{preciseContour.Length}，首点：{preciseContour[0]}");
+                    // 标记首尾点
+                    Cv2.Circle(src, preciseContour[0], 5, Scalar.Blue, -1);
+                    Cv2.Circle(src, preciseContour[preciseContour.Length - 1], 3, Scalar.Green, -1);
+
+                    Console.WriteLine($"最终轮廓点数：{preciseContour.Length}，首点：{preciseContour[0]},末点：{preciseContour[preciseContour.Length - 1]}");
                 }
 
             }
         }
-    }
-
-    // 基于凸性缺陷的凹点检测
-    // 优化凹点检测阈值（修改 DetectConcavePoints 方法）
-    // 增强版凹点检测
-    private static Point[] DetectConcavePoints(Point[] contour)
-    {
-        // 参数校验增强
-        if (contour == null || contour.Length < 40) // 降低最小轮廓长度要求
-        {
-            Console.WriteLine($"轮廓过短：{contour?.Length ?? 0}点");
-            return Array.Empty<Point>();
-        }
-
-        // 获取凸包索引时增加异常处理
-        int[] hullIndices;
-        try
-        {
-            hullIndices = Cv2.ConvexHullIndices(contour, clockwise: true);
-
-            // 新增凸包索引验证
-            if (!IsValidHullIndices(hullIndices, contour.Length))
-            {
-                Console.WriteLine("无效的凸包索引");
-                return Array.Empty<Point>();
-            }
-
-            if (hullIndices.Length < 4) // 凸包至少需要4个点
-            {
-                Console.WriteLine($"无效凸包点数：{hullIndices.Length}");
-                return Array.Empty<Point>();
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"凸包计算异常：{ex.Message}");
-            return Array.Empty<Point>();
-        }
-
-        // 计算凸性缺陷
-        var defects = Cv2.ConvexityDefects(contour, hullIndices);
-        if (defects == null || defects.Length == 0)
-        {
-            Console.WriteLine("未检测到凸包缺陷");
-            return Array.Empty<Point>();
-        }
-
-        // 调试输出
-        Console.WriteLine($"发现凸包缺陷数量：{defects.Length}");
-        foreach (var d in defects.Take(3))
-        {
-            Console.WriteLine($"缺陷数据：[{d[0]},{d[1]},{d[2]},{d[3]}]");
-        }
-
-        // 动态参数计算
-        double contourArea = Cv2.ContourArea(contour);
-        double sizeFactor = Math.Sqrt(contourArea) / 20.0;
-
-        // 统一匿名类型定义
-        return defects
-            .Select(d =>
-            {
-                // 定义统一返回类型
-                var errorResult = new
-                {
-                    Valid = false,
-                    Point = new Point(0, 0),
-                    Depth = 0f,
-                    Angle = 0.0
-                };
-
-                try
-                {
-                    // 解析缺陷参数
-                    int farIndex = (int)d[2];
-
-                    // 索引有效性验证
-                    if (farIndex < 0 || farIndex >= contour.Length)
-                    {
-                        Console.WriteLine($"跳过无效索引：{farIndex}/{contour.Length}");
-                        return errorResult;
-                    }
-
-                    // 计算动态阈值
-                    float depth = (float)d[3] / 256;
-                    double depthThreshold = 3.0 + sizeFactor * 2;
-                    double angleThreshold = Math.PI * 0.45;
-
-                    // 计算角度特征
-                    double angle = CalculateAngleAtPoint(contour, farIndex);
-
-                    // 验证条件
-                    bool validDepth = depth > depthThreshold;
-                    bool validAngle = angle > angleThreshold;
-                    bool isEdge = IsEdgePoint(contour[farIndex], contour);
-
-                    return new
-                    {
-                        Valid = validDepth && validAngle && !isEdge,
-                        Point = contour[farIndex],
-                        Depth = depth,
-                        Angle = angle
-                    };
-                }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"处理缺陷时发生异常：{ex.Message}");
-                    return errorResult;
-                }
-            })
-            .Where(p => p.Valid) // 显式过滤有效点
-            .OrderByDescending(p => p.Depth)
-            .Take(4)
-            .Select(p => p.Point)
-            .ToArray();
-    }
-
-    private static bool IsValidHullIndices(int[] hullIndices, int contourLength)
-    {
-        if (hullIndices.Length < 3) return false;
-        return hullIndices.All(idx => idx >= 0 && idx < contourLength) &&
-               hullIndices.SequenceEqual(hullIndices.OrderBy(x => x));
-    }
-
-    // 新增：计算轮廓点的内角
-    private static double CalculateAngleAtPoint(Point[] contour, int index)
-    {
-
-        // 新增防御性校验
-        if (contour == null || contour.Length == 0)
-        {
-            Console.WriteLine("错误：空轮廓输入");
-            return 0;
-        }
-
-        const int window = 3; // 检查前后3个点的平均方向
-        Vector2 prevDirSum = new Vector2();
-        Vector2 nextDirSum = new Vector2();
-
-        // 安全索引计算（核心修复）
-        //int safeIndex(int i) => (i % contour.Length + contour.Length) % contour.Length;
-
-        for (int i = -window; i <= window; i++)
-        {
-            int prevIdx = (index + i - 1 + contour.Length) % contour.Length;
-            int currIdx = (index + i + contour.Length) % contour.Length;
-            int nextIdx = (index + i + 1) % contour.Length;
-
-            prevDirSum += new Vector2(
-                contour[currIdx].X - contour[prevIdx].X,
-                contour[currIdx].Y - contour[prevIdx].Y);
-
-            nextDirSum += new Vector2(
-                contour[nextIdx].X - contour[currIdx].X,
-                contour[nextIdx].Y - contour[currIdx].Y);
-        }
-
-        double dot = prevDirSum.X * nextDirSum.X + prevDirSum.Y * nextDirSum.Y;
-        double mag1 = Math.Sqrt(prevDirSum.X * prevDirSum.X + prevDirSum.Y * prevDirSum.Y);
-        double mag2 = Math.Sqrt(nextDirSum.X * nextDirSum.X + nextDirSum.Y * nextDirSum.Y);
-
-        return Math.Acos(dot / (mag1 * mag2));
     }
 
     // ===== 新增向量结构体 =====
@@ -392,44 +236,53 @@ public class RobustTemplateMatcher
             new Vector2(a.X + b.X, a.Y + b.Y);
     }
 
-    // 新增辅助方法：过滤位于轮廓边缘的伪凹点
-    private static bool IsEdgePoint(Point p, Point[] contour)
-    {
-        // 检查点是否在轮廓的前5%或后5%范围内
-        int edgeThreshold = (int)(contour.Length * 0.05);
-        int index = Array.IndexOf(contour, p);
-
-        return index < edgeThreshold ||
-               index > contour.Length - edgeThreshold;
-    }
 
     // 修改 RefineContour 方法（保留凹点关键修改）
     private static Point[] RefineContour(Point[] contour, Mat gray)
     {
-        // 步骤1：亚像素优化（降低迭代次数）
+        if (contour == null || contour.Length < 3) return contour ?? Array.Empty<Point>();
+
+        // 步骤1：亚像素优化（保持原逻辑）
         var points = contour.Select(p => new Point2f(p.X, p.Y)).ToArray();
         Cv2.CornerSubPix(gray, points, new Size(3, 3), new Size(-1, -1),
             new TermCriteria(CriteriaTypes.Eps | CriteriaTypes.MaxIter, 5, 0.01));
 
-        // 步骤2：强制保留原始凹点
-        var concaveAnchors = DetectConcavePoints(contour)
-            .Select(p => new Point2f(p.X, p.Y))
-            .ToArray();
+        // 步骤2：插值优化（保持原SmoothContour逻辑）
+        var smoothed = SmoothContour(contour);
 
-        // 合并优化点和凹点锚点
-        var mergedPoints = points.Concat(concaveAnchors).ToArray();
+        // ==== 关键修复1：精确闭合验证 ====
+        if (smoothed.Length > 0 && smoothed[0] != smoothed[smoothed.Length - 1])
+        {
+            smoothed = smoothed.Concat(new[] { smoothed[0] }).ToArray();
+        }
 
-        // 步骤3：凹点敏感型插值
-        var smoothed = SmoothContour(mergedPoints.Select(p => new Point((int)p.X, (int)p.Y)).ToArray());
+        // ==== 关键修复2：暴力去重 ====
+        List<Point> cleaned = new List<Point>();
+        foreach (var p in smoothed)
+        {
+            if (cleaned.Count == 0 || p != cleaned[cleaned.Count - 1])
+                cleaned.Add(p);
+        }
 
-        // 步骤4：凹点补偿多边形近似
-        double epsilon = 0.002 * Cv2.ArcLength(smoothed, true); // 提高精度
-        var approx = Cv2.ApproxPolyDP(smoothed, epsilon, true);
+        // ==== 关键修复3：强制四像素闭合 ====
+        if (cleaned.Count > 1)
+        {
+            var first = cleaned[0];
+            var last = cleaned[cleaned.Count - 1];
 
-        // 最终轮廓 = 近似结果 + 原始凹点（双重保障）
-        return approx;
+            if (Math.Abs(first.X - last.X) + Math.Abs(first.Y - last.Y) > 4)
+            {
+                cleaned.Add(first);
+            }
+        }
+        else if (cleaned.Count == 1)
+        {
+            // 单点保护：复制点形成线段
+            cleaned.Add(cleaned[0]);
+        }
+
+        return cleaned.ToArray();
     }
-
 
     #region 核心算法模块
     private static Point[][] GetContours(Mat grayImage, Rect safeRect)
@@ -565,22 +418,6 @@ public class RobustTemplateMatcher
         }
     }
 
-    private static Point[] GetBestContour(IEnumerable<Point[]> candidates)
-    {
-        return candidates?
-            .Select(c => new
-            {
-                Contour = c,
-                Compactness = CalculateCompactness(c),
-                Center = Cv2.BoundingRect(c).GetCenter(),
-                AspectRatio = Cv2.BoundingRect(c).AspectRatio()
-            })
-            .OrderBy(x => x.Compactness)          // 优先选择更紧凑的
-            .ThenBy(x => GetDistance(x.Center, _selectedROI.GetCenter())) // 其次选择更近的
-            .ThenBy(x => Math.Abs(1.0 - x.AspectRatio)) // 最后选择更方的
-            .Select(x => x.Contour)
-            .FirstOrDefault();
-    }
 
     // 添加紧凑度计算（放在类中）
     private static double CalculateCompactness(Point[] contour)
@@ -593,60 +430,6 @@ public class RobustTemplateMatcher
     private static double GetDistance(Point2f p1, Point2f p2)
     {
         return Math.Sqrt(Math.Pow(p1.X - p2.X, 2) + Math.Pow(p1.Y - p2.Y, 2));
-    }
-
-    // 新增线一致性计算方法
-    private static double CalculateLineConsistency(Point[] contour)
-    {
-        const int LINE_LENGTH_THRESHOLD = 10; // 最小线段长度
-        List<double> angles = new List<double>();
-
-        // 使用Douglas-Peucker算法简化轮廓
-        var simplified = Cv2.ApproxPolyDP(contour, 0.01 * Cv2.ArcLength(contour, true), true);
-
-        // 检测直线段
-        for (int i = 0; i < simplified.Length; i++)
-        {
-            Point p1 = simplified[i];
-            Point p2 = simplified[(i + 1) % simplified.Length];
-
-            double length = Math.Sqrt(Math.Pow(p2.X - p1.X, 2) + Math.Pow(p2.Y - p1.Y, 2));
-            if (length < LINE_LENGTH_THRESHOLD) continue;
-
-            double angle = Math.Atan2(p2.Y - p1.Y, p2.X - p1.X);
-            angles.Add(angle);
-        }
-
-        // 计算主方向一致性
-        if (angles.Count < 4) return 0;
-
-        // 寻找四个主要方向（0°, 90°, 180°, 270°）
-        double[] targetAngles = { 0, Math.PI / 2, Math.PI, 3 * Math.PI / 2 };
-        int matchedDirections = 0;
-
-        foreach (var target in targetAngles)
-        {
-            if (angles.Any(a => Math.Abs(a - target) < Math.PI / 8))
-                matchedDirections++;
-        }
-
-        return (double)matchedDirections / 4;
-    }
-
-    // 新增对称性计算
-    private static double CalculateSymmetry(Point[] contour)
-    {
-        var rect = Cv2.BoundingRect(contour);
-        Point center = new Point(rect.X + rect.Width / 2, rect.Y + rect.Height / 2);
-
-        int symmetryCount = 0;
-        foreach (var p in contour)
-        {
-            Point mirror = new Point(2 * center.X - p.X, 2 * center.Y - p.Y);
-            if (contour.Any(cp => Math.Abs(cp.X - mirror.X) < 2 && Math.Abs(cp.Y - mirror.Y) < 2))
-                symmetryCount++;
-        }
-        return (double)symmetryCount / contour.Length;
     }
 
     // 修改点8：辐射状线段计数
@@ -685,15 +468,6 @@ public class RobustTemplateMatcher
         }
 
         return angleBins.Count(pair => pair.Value);
-    }
-
-    // 修改点9：填充率计算
-    private static double CalculateFillRatio(Point[] contour)
-    {
-        var rect = Cv2.BoundingRect(contour);
-        double contourArea = Cv2.ContourArea(contour);
-        double rectArea = rect.Width * rect.Height;
-        return rectArea > 0 ? contourArea / rectArea : 0;
     }
 
     // 修改点10：改进的Canny阈值计算
@@ -752,8 +526,6 @@ public class RobustTemplateMatcher
         }
     }
 
-    // 修改点13：基于梯度统计的Canny阈值计算
-
     // 修改点14：百分位数计算方法
     private static double CalculatePercentile(Mat mat, double percentile)
     {
@@ -765,30 +537,6 @@ public class RobustTemplateMatcher
             int index = (int)(sorted.Length * percentile);
             return sorted[index];
         }
-    }
-
-
-    private static double CalculateAngleVariance(Point[] approx)
-    {
-        List<double> angles = new List<double>();
-        for (int i = 0; i < approx.Length; i++)
-        {
-            Point p1 = approx[i];
-            Point p2 = approx[(i + 1) % approx.Length];
-            Point p3 = approx[(i + 2) % approx.Length];
-
-            double v1x = p1.X - p2.X;
-            double v1y = p1.Y - p2.Y;
-            double v2x = p3.X - p2.X;
-            double v2y = p3.Y - p2.Y;
-
-            double dotProduct = v1x * v2x + v1y * v2y;
-            double normV1 = Math.Sqrt(v1x * v1x + v1y * v1y);
-            double normV2 = Math.Sqrt(v2x * v2x + v2y * v2y);
-            double angle = Math.Acos(dotProduct / (normV1 * normV2));
-            angles.Add(angle);
-        }
-        return angles.Variance();
     }
 
     private static Point[] SmoothContour(Point[] contour)
@@ -827,7 +575,6 @@ public class RobustTemplateMatcher
         return smoothed.ToArray();
     }
 
-
     private static Rect ValidateROI(Rect roi)
     {
         return new Rect(
@@ -837,7 +584,6 @@ public class RobustTemplateMatcher
             Clamp(roi.Height, 1, _sourceImage.Height - roi.Y)
         );
     }
-
     private static double GetConfidenceThreshold(string[] args)
     {
         if (args.Length > 0 && double.TryParse(args[0], out double t))
@@ -899,7 +645,6 @@ public class RobustTemplateMatcher
     }
     #endregion
 }
-
 
 public static class Extensions
 {
