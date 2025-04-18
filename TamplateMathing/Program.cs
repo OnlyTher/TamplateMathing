@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using OpenCvSharp;
 
+
 using OpenCvSharp.XImgProc;
 
 public class RobustTemplateMatcher
@@ -26,8 +27,17 @@ public class RobustTemplateMatcher
 
     static void Main(string[] args)
     {
+        //创建目录
         Directory.CreateDirectory(_outputDir);
         Directory.CreateDirectory(_failureDir);
+
+        //如果coordinates.txt已经存在，就删掉
+        string outputDirectory = Path.Combine(Directory.GetCurrentDirectory(), "outputs");
+        string filePath = Path.Combine(outputDirectory, "Coordinates.txt");
+        if (File.Exists(filePath))
+        {
+            File.Delete(filePath);
+        }
 
         var imageFiles = Directory.GetFiles("sources")
             .Where(f => f.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase) ||
@@ -177,6 +187,16 @@ public class RobustTemplateMatcher
                     localCenter.Y + safeRect.Y
                 );
 
+
+                // ==== 新增：写入全局坐标到文件 ====
+                string outputDirectory = Path.Combine(Directory.GetCurrentDirectory(), "outputs");
+                string filePath = Path.Combine(outputDirectory, "Coordinates.txt");
+                string line = $"{globalCenter.X},{globalCenter.Y},{DateTime.Now:yyyy-MM-dd HH:mm:ss}\n"; // 追加时间戳便于区分
+                using (StreamWriter writer = File.AppendText(filePath))
+                {
+                    writer.Write(line);
+                }
+
                 // 绘制正十字标记（绿色十字，尺寸自适应）
                 int crossSize = (int)(Math.Max(template.Width, template.Height) * 0.03); // 15%的模板尺寸
                 Cv2.Line(src,
@@ -209,7 +229,7 @@ public class RobustTemplateMatcher
                         lineType: LineTypes.AntiAlias);
 
                     Cv2.ImShow("最终轮廓：", src);
-                    Cv2.WaitKey(100);
+                    Cv2.WaitKey(10);
 
                     Console.WriteLine($"最终轮廓点数：{preciseContour.Length}，首点：{preciseContour[0]},首点：{preciseContour[preciseContour.Length - 1]}");
                 }
@@ -415,13 +435,16 @@ public class RobustTemplateMatcher
         Cv2.CornerSubPix(gray, points2f, new Size(3, 3), new Size(-1, -1),
             new TermCriteria(CriteriaTypes.Eps | CriteriaTypes.MaxIter, 5, 0.01));
         Console.WriteLine($"亚像素优化后轮廓点数：{points2f.Length}");
-        Cv2.DrawContours(
-            image: gray,
-            contours: new[] { contour },
-            contourIdx: 0,
-            color: Scalar.Red,
-            thickness: 2,
-            lineType: LineTypes.AntiAlias);
+
+        //Cv2.DrawContours(
+        //    image: gray,
+        //    contours: new[] { contour },
+        //    contourIdx: 0,
+        //    color: Scalar.Red,
+        //    thickness: 2,
+        //    lineType: LineTypes.AntiAlias);
+        //Cv2.ImShow("亚像素优化后：", gray);
+        //Cv2.WaitKey(0);
 
         // 步骤3：凹点敏感型插值（显式类型转换）
         var interpolatedPoints = points2f
@@ -474,7 +497,7 @@ public class RobustTemplateMatcher
             // 修改点3：十字特征定向连接
             using (var connectedEdges = new Mat())
             {
-                const int baseSize = 13; // 基准尺寸，方便参数调整 15-》13
+                const int baseSize = 9; // 基准尺寸，方便参数调整 15-》13-》9
                 var sizeFact = Math.Max(1, processed.Width / 512.0); // 基于图像尺寸的缩放因子
 
                 // 第一阶段：优化水平/垂直连接（动态尺寸）
@@ -519,10 +542,6 @@ public class RobustTemplateMatcher
                     preserveKernel,
                     iterations: 1);
 
-                //// 调试输出
-                //Cv2.ImShow("PostProcessing", connectedEdges);
-                //Cv2.WaitKey(10);
-
                 connectedEdges.CopyTo(processed);
             }
             Cv2.ImShow("3. Connected Edges", processed);
@@ -542,7 +561,7 @@ public class RobustTemplateMatcher
                 int minPoints = (int)(20 * Math.Max(1, sizeFactor)); // 最小点数15~动态调整
                 if (contour.Length < minPoints)
                 {
-                    Console.WriteLine($"轮廓点数不足：{contour.Length}/{minPoints}");
+                    //Console.WriteLine($"轮廓点数不足：{contour.Length}/{minPoints}");
                     continue;
                 }
 
@@ -798,7 +817,7 @@ public class RobustTemplateMatcher
     private static Point[] SmoothContour(Point[] contour)
     {
         List<Point> smoothed = new List<Point>();
-        const double step = 0.15; // 增大步长减少插值密度
+        const double step = 0.05; // 增大步长减少插值密度
 
         for (int i = 0; i < contour.Length; i++)
         {
@@ -842,10 +861,15 @@ public class RobustTemplateMatcher
             }
         }
 
-        // 新增：合并相邻重复点
-        return smoothed
-            .Where((p, i) => i == 0 || p.DistanceTo(smoothed[i - 1]) > 2)
-            .ToArray();
+        var gaussianSmoothed = smoothed.Select(p =>
+        {
+            // 高斯模糊坐标（半径3像素）
+            int x = (int)Math.Round(p.X + 5 * (new Random().NextDouble() - 0.5));
+            int y = (int)Math.Round(p.Y + 5 * (new Random().NextDouble() - 0.5));
+            return new Point(x, y);
+        }).ToArray();
+
+        return gaussianSmoothed;
     }
 
     private static double CalculateAngleAtThreePoint(Point[] threePoints)
