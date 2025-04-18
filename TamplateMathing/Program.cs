@@ -471,56 +471,54 @@ public class RobustTemplateMatcher
             // 修改点3：十字特征定向连接
             using (var connectedEdges = new Mat())
             {
-                // 第一阶段：水平方向强化连接
-                var horizontalKernel = Cv2.GetStructuringElement(
+                const int baseSize = 13; // 基准尺寸，方便参数调整 15-》13
+                var sizeFact = Math.Max(1, processed.Width / 512.0); // 基于图像尺寸的缩放因子
+
+                // 第一阶段：优化水平/垂直连接（动态尺寸）
+                var hKernel = Cv2.GetStructuringElement(
                     MorphShapes.Rect,
-                    new Size(21, 3));  // 加宽水平连接范围
+                    new Size((int)(baseSize * 1.5 * sizeFact), 3));
                 Cv2.MorphologyEx(processed, connectedEdges,
                     MorphTypes.Close,
-                    horizontalKernel,
-                    iterations: 1);
+                    hKernel,
+                    iterations: 1); // 增加迭代次数
 
-                // 第一阶段：垂直方向强化连接
-                var verticalKernel = Cv2.GetStructuringElement(
+                var vKernel = Cv2.GetStructuringElement(
                     MorphShapes.Rect,
-                    new Size(3, 21));  // 加宽水平连接范围
-                Cv2.MorphologyEx(processed, connectedEdges,
+                    new Size(3, (int)(baseSize * 1.5 * sizeFact)));
+                Cv2.MorphologyEx(connectedEdges, connectedEdges,
                     MorphTypes.Close,
-                    horizontalKernel,
+                    vKernel,
                     iterations: 1);
 
-                // 第二阶段：45度对角线连接
-                var diagKernel = new Mat(7, 7, MatType.CV_8UC1, Scalar.All(0));
-                for (int i = 0; i < 7; i++)
+                // 第二阶段：多角度连接增强（针对凸角）
+                var angleKernels = new[] { 45, 30, 60 }; // 覆盖常见凸角角度
+                foreach (var angle in angleKernels)
                 {
-                    // 创建45度对角线核
-                    diagKernel.Set<byte>(i, i, 1);
-                    diagKernel.Set<byte>(i, 6 - i, 1);
+                    using (var aKernel = CreateAngleAdaptiveKernel(baseSize, angle, sizeFact))
+                    {
+                        Cv2.MorphologyEx(connectedEdges, connectedEdges,
+                            MorphTypes.Close,
+                            aKernel,
+                            iterations: 1);
+                    }
                 }
+
+                // 第三阶段：精准间隙处理（调试友好）
+                ApplySmartGapFilling(connectedEdges, processed, sizeFact);
+
+                // 第四阶段：边缘保留优化
+                var preserveKernel = Cv2.GetStructuringElement(
+                    MorphShapes.Cross,
+                    new Size(3, 3));
                 Cv2.MorphologyEx(connectedEdges, connectedEdges,
                     MorphTypes.Close,
-                    diagKernel,
+                    preserveKernel,
                     iterations: 1);
 
-                // 第三阶段：全向强化连接
-                var strongKernel = Cv2.GetStructuringElement(
-                    MorphShapes.Cross,
-                    new Size(9, 9));  // 增大核尺寸
-                Cv2.MorphologyEx(connectedEdges, connectedEdges,
-                    MorphTypes.Close,
-                    strongKernel,
-                    iterations: 3);
-
-                // 第四阶段：智能间隙填充（关键新增）
-                Cv2.Dilate(connectedEdges, connectedEdges,
-                     null,  // 使用3x3矩形核
-                    iterations: 2);
-                Cv2.Erode(connectedEdges, connectedEdges,
-                    null,
-                    iterations: 2);
-
-                // 最终边缘细化（关键新增）
-                //XImgProc.Thinning(connectedEdges, connectedEdges, ThinningTypes.GUOHALL);  // 细化算法保持单像素宽度
+                // 调试输出
+                Cv2.ImShow("PostProcessing", connectedEdges);
+                Cv2.WaitKey(10);
 
                 connectedEdges.CopyTo(processed);
             }
@@ -596,15 +594,15 @@ public class RobustTemplateMatcher
                 .ThenBy(c => GetDistance(Cv2.BoundingRect(c).GetCenter(), _selectedROI.GetCenter()))
                 .FirstOrDefault();  // 强制取第一个
 
-            Cv2.DrawContours(
-image: grayImage,
-contours: new[] { bestContour },
-contourIdx: 0,
-color: Scalar.Red,
-thickness: 2,
-lineType: LineTypes.AntiAlias);
-            Cv2.ImShow("1.Contour test", grayImage);
-            Cv2.WaitKey(0);
+//            Cv2.DrawContours(
+//image: grayImage,
+//contours: new[] { bestContour },
+//contourIdx: 0,
+//color: Scalar.Red,
+//thickness: 2,
+//lineType: LineTypes.AntiAlias);
+//            Cv2.ImShow("1.Contour test", grayImage);
+//            Cv2.WaitKey(0);
 
             // ===== [轮廓后处理] =====
             // 强制生成闭合轮廓
@@ -619,6 +617,52 @@ lineType: LineTypes.AntiAlias);
             }
 
             return new Point[0][];
+        }
+    }
+
+    // 角度自适应核创建（安全方法）
+    private static Mat CreateAngleAdaptiveKernel(int baseSize, double angle, double sizeFactor)
+    {
+        int kernelSize = (int)(baseSize * sizeFactor);
+        var kernel = new Mat(kernelSize, kernelSize, MatType.CV_8UC1, Scalar.Black);
+
+        double radians = angle * Math.PI / 180.0;
+        int center = kernelSize / 2;
+
+        // 安全绘制线段
+        for (int i = -center + 1; i < center; i++)
+        {
+            int x = center + (int)(i * Math.Cos(radians));
+            int y = center + (int)(i * Math.Sin(radians));
+            if (x >= 0 && x < kernelSize && y >= 0 && y < kernelSize)
+            {
+                kernel.Set<byte>(y, x, 1);
+            }
+        }
+        return kernel;
+    }
+
+    // 智能间隙填充（独立方法方便测试）
+    private static void ApplySmartGapFilling(Mat src, Mat original, double sizeFactor)
+    {
+        using (var gapMap = new Mat())
+        {
+            // 生成间隙热力图
+            Cv2.Absdiff(src, original, gapMap);
+            Cv2.Threshold(gapMap, gapMap, 1, 255, ThresholdTypes.Binary);
+
+            // 动态参数计算
+            int iterations = (int)(2 * sizeFactor);
+            int kernelSize = (int)(3 * sizeFactor);
+
+            using (var dilateKernel = Cv2.GetStructuringElement(
+                MorphShapes.Ellipse,
+                new Size(kernelSize, kernelSize)))
+            {
+                // 限制在间隙区域操作
+                Cv2.Dilate(src, src, dilateKernel, iterations: iterations);
+                Cv2.Erode(src, src, dilateKernel, iterations: iterations - 1);
+            }
         }
     }
 
