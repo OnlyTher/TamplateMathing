@@ -208,6 +208,9 @@ public class RobustTemplateMatcher
                         thickness: 2,
                         lineType: LineTypes.AntiAlias);
 
+                    Cv2.ImShow("最终轮廓：", src);
+                    Cv2.WaitKey(100);
+
                     Console.WriteLine($"最终轮廓点数：{preciseContour.Length}，首点：{preciseContour[0]},首点：{preciseContour[preciseContour.Length - 1]}");
                 }
 
@@ -516,9 +519,9 @@ public class RobustTemplateMatcher
                     preserveKernel,
                     iterations: 1);
 
-                // 调试输出
-                Cv2.ImShow("PostProcessing", connectedEdges);
-                Cv2.WaitKey(10);
+                //// 调试输出
+                //Cv2.ImShow("PostProcessing", connectedEdges);
+                //Cv2.WaitKey(10);
 
                 connectedEdges.CopyTo(processed);
             }
@@ -588,21 +591,19 @@ public class RobustTemplateMatcher
                 crossCandidates.Add(contour);
             }
 
-            // ===== [最优轮廓选择] =====
             var bestContour = crossCandidates
-                .OrderBy(c => CalculateCompactness(c))  // 按紧凑度排序
-                .ThenBy(c => GetDistance(Cv2.BoundingRect(c).GetCenter(), _selectedROI.GetCenter()))
-                .FirstOrDefault();  // 强制取第一个
+                .OrderByDescending(c => Cv2.ContourArea(c))
+                .FirstOrDefault();
 
-//            Cv2.DrawContours(
-//image: grayImage,
-//contours: new[] { bestContour },
-//contourIdx: 0,
-//color: Scalar.Red,
-//thickness: 2,
-//lineType: LineTypes.AntiAlias);
-//            Cv2.ImShow("1.Contour test", grayImage);
-//            Cv2.WaitKey(0);
+            //            Cv2.DrawContours(
+            //image: grayImage,
+            //contours: new[] { bestContour },
+            //contourIdx: 0,
+            //color: Scalar.Red,
+            //thickness: 2,
+            //lineType: LineTypes.AntiAlias);
+            //            Cv2.ImShow("1.Contour test", grayImage);
+            //            Cv2.WaitKey(0);
 
             // ===== [轮廓后处理] =====
             // 强制生成闭合轮廓
@@ -797,7 +798,7 @@ public class RobustTemplateMatcher
     private static Point[] SmoothContour(Point[] contour)
     {
         List<Point> smoothed = new List<Point>();
-        const double step = 0.8; // 增大步长减少插值密度
+        const double step = 0.15; // 增大步长减少插值密度
 
         for (int i = 0; i < contour.Length; i++)
         {
